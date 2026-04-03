@@ -18,26 +18,52 @@ test("buildClaudeEnv injects gateway settings and privacy toggles", () => {
     gatewayUrl: "http://127.0.0.1:43123",
     localToken: "token-123",
     config: DEFAULT_CONFIG,
-    launchHints: {
-      effort: "max",
-      outputFormat: "json",
-      jsonSchema: "{\"type\":\"object\"}",
-      continue: true,
-    },
   });
 
   assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:43123");
-  assert.equal(env.ANTHROPIC_AUTH_TOKEN, "token-123");
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, undefined);
   assert.equal(env.ANTHROPIC_API_KEY, undefined);
+  assert.equal(env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "gpt-5.4-mini");
+  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, "gpt-5.4");
+  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, "gpt-5.4");
   assert.equal(env.CLAUDE_CODE_EFFORT_LEVEL, undefined);
-  assert.equal(
-    env.ANTHROPIC_CUSTOM_HEADERS,
-    "x-existing: keep-me\nx-codex-proxy-cc-effort-hint: max\nx-codex-proxy-cc-output-format-hint: json\nx-codex-proxy-cc-json-schema-hint: eyJ0eXBlIjoib2JqZWN0In0=\nx-codex-proxy-cc-continue-hint: true",
-  );
-  assert.equal(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "1");
-  assert.equal(env.DISABLE_TELEMETRY, "1");
-  assert.equal(env.DISABLE_ERROR_REPORTING, "1");
-  assert.equal(env.DISABLE_FEEDBACK_COMMAND, "1");
+  assert.equal(env.ANTHROPIC_CUSTOM_HEADERS, "x-existing: keep-me");
+  assert.equal(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined);
+  assert.equal(env.DISABLE_TELEMETRY, undefined);
+  assert.equal(env.DISABLE_ERROR_REPORTING, undefined);
+  assert.equal(env.DISABLE_FEEDBACK_COMMAND, undefined);
+});
+
+test("buildClaudeEnv derives Claude default model env vars from configured Codex targets", () => {
+  const env = buildClaudeEnv({
+    parentEnv: {
+      PATH: process.env.PATH || "",
+    },
+    gatewayUrl: "http://127.0.0.1:43123",
+    localToken: "token-123",
+    config: {
+      ...DEFAULT_CONFIG,
+      profiles: {
+        ...DEFAULT_CONFIG.profiles,
+        haiku: {
+          ...DEFAULT_CONFIG.profiles.haiku,
+          codexModel: "gpt-5-mini-custom",
+        },
+        sonnet: {
+          ...DEFAULT_CONFIG.profiles.sonnet,
+          codexModel: "gpt-5-main-custom",
+        },
+        opus: {
+          ...DEFAULT_CONFIG.profiles.opus,
+          codexModel: "gpt-5-deep-custom",
+        },
+      },
+    },
+  });
+
+  assert.equal(env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "gpt-5-mini-custom");
+  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, "gpt-5-main-custom");
+  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, "gpt-5-deep-custom");
 });
 
 test("buildClaudeEnv can pin Claude effort environment overrides", () => {
@@ -60,6 +86,19 @@ test("buildClaudeEnv can pin Claude effort environment overrides", () => {
   assert.equal(env.CLAUDE_CODE_EFFORT_LEVEL, "unset");
 });
 
+test("buildClaudeEnv still injects a gateway auth token for non-loopback proxies", () => {
+  const env = buildClaudeEnv({
+    parentEnv: {
+      PATH: process.env.PATH || "",
+    },
+    gatewayUrl: "http://192.168.1.20:43123",
+    localToken: "token-123",
+    config: DEFAULT_CONFIG,
+  });
+
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, "token-123");
+});
+
 test("parseClaudeLaunchHints reads --model and --effort passthrough flags", () => {
   assert.deepEqual(
     parseClaudeLaunchHints([
@@ -67,63 +106,17 @@ test("parseClaudeLaunchHints reads --model and --effort passthrough flags", () =
       "--model",
       "opus",
       "--effort=max",
-      "--output-format",
-      "json",
-      "--json-schema",
-      "{\"type\":\"object\"}",
-      "-c",
       "hello",
     ]),
     {
       model: "opus",
       effort: "max",
-      outputFormat: "json",
-      jsonSchema: "{\"type\":\"object\"}",
-      continue: true,
     },
   );
 
   assert.deepEqual(parseClaudeLaunchHints(["--effort", "high"]), {
     effort: "high",
   });
-});
-
-test("parseClaudeLaunchHints captures resume and explicit session identifiers", () => {
-  assert.deepEqual(
-    parseClaudeLaunchHints([
-      "-p",
-      "--resume=11111111-1111-4111-8111-111111111111",
-      "--session-id",
-      "22222222-2222-4222-8222-222222222222",
-      "hello",
-    ]),
-    {
-      continue: true,
-      resumeKey: "11111111-1111-4111-8111-111111111111",
-      sessionKey: "22222222-2222-4222-8222-222222222222",
-    },
-  );
-});
-
-test("buildClaudeEnv forwards resume and session routing headers", () => {
-  const env = buildClaudeEnv({
-    parentEnv: {
-      PATH: process.env.PATH || "",
-    },
-    gatewayUrl: "http://127.0.0.1:43123",
-    localToken: "token-123",
-    config: DEFAULT_CONFIG,
-    launchHints: {
-      continue: true,
-      resumeKey: "11111111-1111-4111-8111-111111111111",
-      sessionKey: "22222222-2222-4222-8222-222222222222",
-    },
-  });
-
-  assert.equal(
-    env.ANTHROPIC_CUSTOM_HEADERS,
-    "x-codex-proxy-cc-continue-hint: true\nx-codex-proxy-cc-resume-key: 11111111-1111-4111-8111-111111111111\nx-codex-proxy-cc-session-key: 22222222-2222-4222-8222-222222222222",
-  );
 });
 
 test("generateLocalGatewayToken returns a random-looking token", () => {

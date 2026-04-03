@@ -43,34 +43,31 @@ test("file session store isolates keyed conversations within the same cwd", asyn
   assert.equal(latestConversation.messages[0].content, "remember beta");
 });
 
-test("file session store lists recent conversations in reverse chronological order", async () => {
-  const tempDir = await mkdtemp(path.join(os.tmpdir(), "codex-proxy-cc-session-store-list-"));
+test("file session store persists transport metadata for codex thread reuse", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "codex-proxy-cc-session-store-metadata-"));
   const filePath = path.join(tempDir, "recent-conversations.json");
   const store = createFileSessionStore({ filePath, maxEntries: 10 });
 
   await store.saveRecentConversation({
-    cwd: "/tmp/project-a",
-    conversationKey: "11111111-1111-4111-8111-111111111111",
-    messages: [{ role: "user", content: "remember alpha" }],
-  });
-  await delay(5);
-  await store.saveRecentConversation({
-    cwd: "/tmp/project-a",
-    conversationKey: "22222222-2222-4222-8222-222222222222",
-    messages: [{ role: "user", content: "remember beta" }],
-  });
-  await delay(5);
-  await store.saveRecentConversation({
-    cwd: "/tmp/project-b",
-    messages: [{ role: "user", content: "remember gamma" }],
+    cwd: "/tmp/project-meta",
+    conversationKey: "33333333-3333-4333-8333-333333333333",
+    messages: [{ role: "user", content: "remember thread metadata" }],
+    metadata: {
+      backend: "codex-app-server",
+      threadId: "thread_123",
+      threadPath: "/tmp/thread-123.json",
+      model: "gpt-5.4",
+    },
   });
 
-  const projectA = await store.listRecentConversations({ cwd: "/tmp/project-a" });
-  const all = await store.listRecentConversations({ limit: 2 });
+  const entry = await store.loadRecentConversation({
+    cwd: "/tmp/project-meta",
+    conversationKey: "33333333-3333-4333-8333-333333333333",
+  });
 
-  assert.equal(projectA.length, 2);
-  assert.equal(projectA[0].conversationKey, "22222222-2222-4222-8222-222222222222");
-  assert.equal(projectA[1].conversationKey, "11111111-1111-4111-8111-111111111111");
-  assert.equal(all.length, 2);
-  assert.equal(all[0].cwd, "/tmp/project-b");
+  assert.equal(entry.metadata.backend, "codex-app-server");
+  assert.equal(entry.metadata.threadId, "thread_123");
+  assert.equal(entry.metadata.threadPath, "/tmp/thread-123.json");
+  assert.equal(entry.metadata.model, "gpt-5.4");
+  assert.match(entry.workspaceId, /^[a-f0-9]{40}$/);
 });

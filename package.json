@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Run Claude Code through a local Anthropic-compatible gateway backed by Codex OAuth or the OpenAI Responses API.",
+  "description": "Run Claude Code through a local Anthropic-compatible gateway that preserves Claude Code UX and swaps only model sampling to Codex.",
   "author": "VOIDXAI",
   "license": "MIT",
   "keywords": [
@@ -13,7 +13,6 @@
     "codex",
     "developer-tools",
     "gateway",
-    "openai",
     "proxy"
   ],
   "engines": {

@@ -1,7 +1,9 @@
 import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
+
+const WRITE_QUEUES = new Map();
 
 function defaultStorePath() {
   const stateHome =
@@ -20,6 +22,15 @@ function normalizeConversationKey(value) {
 
   const normalized = value.trim();
   return normalized ? normalized : undefined;
+}
+
+async function normalizeWorkspaceCwd(cwd) {
+  const normalized = path.resolve(String(cwd || ""));
+  try {
+    return await realpath(normalized);
+  } catch {
+    return normalized;
+  }
 }
 
 function keyForConversation(cwd, conversationKey) {
@@ -66,6 +77,76 @@ async function writeStore(filePath, data) {
   await rename(tempPath, filePath);
 }
 
+async function withWriteQueue(filePath, operation) {
+  const previous = WRITE_QUEUES.get(filePath) || Promise.resolve();
+  let release;
+  const current = new Promise(resolve => {
+    release = resolve;
+  });
+  const queued = previous.finally(() => current);
+  WRITE_QUEUES.set(filePath, queued);
+
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (WRITE_QUEUES.get(filePath) === queued) {
+      WRITE_QUEUES.delete(filePath);
+    }
+  }
+}
+
+function buildSessionMetadata(metadata = {}) {
+  if (!metadata || typeof metadata !== "object") {
+    return undefined;
+  }
+
+  const backend = typeof metadata.backend === "string" && metadata.backend.trim()
+    ? metadata.backend.trim()
+    : undefined;
+  const threadId = typeof metadata.threadId === "string" && metadata.threadId.trim()
+    ? metadata.threadId.trim()
+    : undefined;
+  const threadPath = typeof metadata.threadPath === "string" && metadata.threadPath.trim()
+    ? metadata.threadPath.trim()
+    : undefined;
+  const model = typeof metadata.model === "string" && metadata.model.trim()
+    ? metadata.model.trim()
+    : undefined;
+
+  if (!backend && !threadId && !threadPath && !model) {
+    return undefined;
+  }
+
+  return {
+    ...(backend ? { backend } : {}),
+    ...(threadId ? { threadId } : {}),
+    ...(threadPath ? { threadPath } : {}),
+    ...(model ? { model } : {}),
+  };
+}
+
+function normalizeStoredEntry(entry) {
+  if (!entry || typeof entry !== "object" || !Array.isArray(entry.messages) || entry.messages.length === 0) {
+    return null;
+  }
+
+  const cwd = typeof entry.cwd === "string" && entry.cwd.trim() ? entry.cwd : undefined;
+  if (!cwd) {
+    return null;
+  }
+
+  return {
+    cwd,
+    workspaceId: keyForCwd(cwd),
+    conversationKey: normalizeConversationKey(entry.conversationKey),
+    updatedAt: entry.updatedAt,
+    messages: entry.messages,
+    metadata: buildSessionMetadata(entry.metadata),
+  };
+}
+
 export function createFileSessionStore({
   filePath = defaultStorePath(),
   maxMessages = 50,
@@ -84,77 +165,65 @@ export function createFileSessionStore({
     kind: "file-session-store",
     async loadRecentConversation({ cwd, conversationKey }) {
       const store = await readStore(filePath);
+      const normalizedCwd = await normalizeWorkspaceCwd(cwd);
       const normalizedConversationKey = normalizeConversationKey(conversationKey);
+      const entries = Object.values(store.conversations)
+        .map(item => normalizeStoredEntry(item))
+        .filter(Boolean);
       const entry = normalizedConversationKey
         ? sortEntries(
-            Object.values(store.conversations).filter(
-              item => item?.cwd === cwd && item?.conversationKey === normalizedConversationKey,
+            entries.filter(
+              item => item.cwd === normalizedCwd && item.conversationKey === normalizedConversationKey,
             ),
           )[0]
-        : sortEntries(Object.values(store.conversations).filter(item => item?.cwd === cwd))[0] ||
-          store.conversations[keyForCwd(cwd)];
-      if (!entry || !Array.isArray(entry.messages) || entry.messages.length === 0) {
+        : sortEntries(entries.filter(item => item.cwd === normalizedCwd))[0] ||
+          normalizeStoredEntry(store.conversations[keyForCwd(normalizedCwd)]);
+      if (!entry) {
         return null;
       }
-      return {
-        cwd: entry.cwd,
-        conversationKey: entry.conversationKey,
-        updatedAt: entry.updatedAt,
-        messages: entry.messages,
-      };
+      return entry;
     },
-    async saveRecentConversation({ cwd, messages, conversationKey }) {
+    async saveRecentConversation({ cwd, messages, conversationKey, metadata }) {
       if (!cwd || !Array.isArray(messages) || messages.length === 0) {
         return;
       }
 
-      const store = await readStore(filePath);
+      const normalizedCwd = await normalizeWorkspaceCwd(cwd);
       const normalizedConversationKey = normalizeConversationKey(conversationKey);
-      const conversations = {
-        ...store.conversations,
-        [keyForConversation(cwd, normalizedConversationKey)]: {
-          cwd,
-          updatedAt: new Date().toISOString(),
-          messages: messages.slice(-maxMessages),
-          ...(normalizedConversationKey ? { conversationKey: normalizedConversationKey } : {}),
-        },
-      };
+      const normalizedMetadata = buildSessionMetadata(metadata);
 
-      const orderedEntries = Object.entries(conversations)
-        .sort(([, left], [, right]) => {
-          const leftTime = Date.parse(left?.updatedAt || 0);
-          const rightTime = Date.parse(right?.updatedAt || 0);
-          return rightTime - leftTime;
-        })
-        .slice(0, maxEntries);
+      await withWriteQueue(filePath, async () => {
+        const store = await readStore(filePath);
+        const conversations = {
+          ...store.conversations,
+          [keyForConversation(normalizedCwd, normalizedConversationKey)]: {
+            cwd: normalizedCwd,
+            updatedAt: new Date().toISOString(),
+            messages: messages.slice(-maxMessages),
+            ...(normalizedConversationKey ? { conversationKey: normalizedConversationKey } : {}),
+            ...(normalizedMetadata ? { metadata: normalizedMetadata } : {}),
+          },
+        };
 
-      await writeStore(filePath, {
-        conversations: Object.fromEntries(orderedEntries),
+        const orderedEntries = Object.entries(conversations)
+          .sort(([, left], [, right]) => {
+            const leftTime = Date.parse(left?.updatedAt || 0);
+            const rightTime = Date.parse(right?.updatedAt || 0);
+            return rightTime - leftTime;
+          })
+          .slice(0, maxEntries);
+
+        await writeStore(filePath, {
+          conversations: Object.fromEntries(orderedEntries),
+        });
       });
       logger?.debug?.("Saved recent proxy conversation", {
-        cwd,
+        cwd: normalizedCwd,
         conversationKey: normalizedConversationKey,
         messageCount: messages.length,
+        metadata: normalizedMetadata,
         filePath,
       });
-    },
-    async listRecentConversations({ cwd, limit = maxEntries } = {}) {
-      const store = await readStore(filePath);
-      const filtered = Object.values(store.conversations).filter(entry => {
-        if (!entry || !Array.isArray(entry.messages) || entry.messages.length === 0) {
-          return false;
-        }
-        return cwd ? entry.cwd === cwd : true;
-      });
-
-      return sortEntries(filtered)
-        .slice(0, limit)
-        .map(entry => ({
-          cwd: entry.cwd,
-          conversationKey: entry.conversationKey,
-          updatedAt: entry.updatedAt,
-          messages: entry.messages,
-        }));
     },
   };
 }

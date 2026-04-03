@@ -3,9 +3,6 @@ import http from "node:http";
 import { createGatewayBackend } from "../backends/create-backend.mjs";
 import { AppError } from "../shared/errors.mjs";
 import { readJsonBody, writeAnthropicError, writeJson } from "../shared/http.mjs";
-import { createFileSessionStore } from "../shared/session-store.mjs";
-
-const SUPPORTED_EFFORT_HINTS = new Set(["low", "medium", "high", "max"]);
 
 function normalizeAuthToken(headers) {
   const authorization = headers.authorization;
@@ -18,12 +15,31 @@ function normalizeAuthToken(headers) {
   return null;
 }
 
-function ensureAuthorized(req, expectedToken) {
+function isLoopbackHost(hostname) {
+  return hostname === "127.0.0.1" || hostname === "::1" || hostname === "localhost";
+}
+
+function isLoopbackRemoteAddress(address) {
+  return (
+    address === "127.0.0.1" ||
+    address === "::1" ||
+    address === "::ffff:127.0.0.1"
+  );
+}
+
+function shouldAllowLoopbackWithoutToken(bindHost) {
+  return isLoopbackHost(bindHost);
+}
+
+function ensureAuthorized(req, expectedToken, allowLoopbackWithoutToken = false) {
   if (!expectedToken) {
     return;
   }
   const token = normalizeAuthToken(req.headers);
   if (token === expectedToken) {
+    return;
+  }
+  if (allowLoopbackWithoutToken && isLoopbackRemoteAddress(req.socket?.remoteAddress)) {
     return;
   }
   throw new AppError("Missing or invalid local gateway token", {
@@ -44,179 +60,6 @@ function readHeaderValue(headers, name) {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-function decodeJsonSchemaHint(value) {
-  if (!value) {
-    return null;
-  }
-
-  try {
-    const decoded = Buffer.from(value, "base64").toString("utf8");
-    const parsed = JSON.parse(decoded);
-    return parsed && typeof parsed === "object" ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-function isContinueHintEnabled(headers) {
-  return readHeaderValue(headers, "x-codex-proxy-cc-continue-hint") === "true";
-}
-
-function readResumeConversationKey(headers) {
-  return readHeaderValue(headers, "x-codex-proxy-cc-resume-key");
-}
-
-function readPersistedConversationKey(headers) {
-  return readHeaderValue(headers, "x-codex-proxy-cc-session-key") || readResumeConversationKey(headers);
-}
-
-function isPlainTextBlock(block) {
-  return block?.type === "text" && typeof block.text === "string" && block.text.trim() !== "";
-}
-
-function normalizeAssistantContent(content) {
-  if (!Array.isArray(content)) {
-    return [];
-  }
-  return content.filter(block => block && typeof block === "object");
-}
-
-function buildPersistedConversation(body, anthropicResponse) {
-  const baseMessages = Array.isArray(body?.messages) ? body.messages : [];
-  const responseContent = normalizeAssistantContent(anthropicResponse?.content);
-  if (responseContent.some(block => isPlainTextBlock(block))) {
-    return [
-      ...baseMessages,
-      {
-        role: "assistant",
-        content: responseContent,
-      },
-    ];
-  }
-
-  const structuredOutputBlock = responseContent.find(
-    block => block?.type === "tool_use" && block?.name === "StructuredOutput" && block.input,
-  );
-  if (structuredOutputBlock) {
-    return [
-      ...baseMessages,
-      {
-        role: "assistant",
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(structuredOutputBlock.input),
-          },
-        ],
-      },
-    ];
-  }
-
-  return null;
-}
-
-async function maybeApplyContinueHistory({
-  body,
-  headers,
-  logger,
-  sessionStore,
-  appliedContinueSessions,
-  markApplied,
-}) {
-  if (!sessionStore || !isContinueHintEnabled(headers)) {
-    return body;
-  }
-
-  const sessionId = readHeaderValue(headers, "x-claude-code-session-id");
-  if (markApplied && sessionId && appliedContinueSessions.has(sessionId)) {
-    return body;
-  }
-
-  if (!Array.isArray(body?.messages) || body.messages.length !== 1 || body.messages[0]?.role !== "user") {
-    return body;
-  }
-
-  const conversationKey = readResumeConversationKey(headers);
-  const recentConversation = await sessionStore.loadRecentConversation({
-    cwd: process.cwd(),
-    conversationKey,
-  });
-  if (!recentConversation?.messages?.length) {
-    return body;
-  }
-
-  logger?.debug?.("Restoring recent proxy conversation for continue", {
-    sessionId,
-    conversationKey,
-    restoredMessageCount: recentConversation.messages.length,
-  });
-  body.messages = [...recentConversation.messages, ...body.messages];
-  if (markApplied && sessionId) {
-    appliedContinueSessions.add(sessionId);
-  }
-  return body;
-}
-
-function applyRequestHints(body, headers, logger) {
-  if (!body || typeof body !== "object") {
-    return body;
-  }
-
-  const explicitEffort = body?.output_config?.effort;
-  const effortHint = readHeaderValue(headers, "x-codex-proxy-cc-effort-hint")?.toLowerCase();
-  const anthropicBeta = readHeaderValue(headers, "anthropic-beta");
-  const sessionId = readHeaderValue(headers, "x-claude-code-session-id");
-  const outputFormatHint = readHeaderValue(headers, "x-codex-proxy-cc-output-format-hint")?.toLowerCase();
-  const jsonSchemaHint = decodeJsonSchemaHint(
-    readHeaderValue(headers, "x-codex-proxy-cc-json-schema-hint"),
-  );
-  const resumeConversationKey = readResumeConversationKey(headers);
-  const persistedConversationKey = readPersistedConversationKey(headers);
-
-  logger?.debug?.("Gateway request metadata", {
-    model: body.model,
-    sessionId,
-    messageCount: Array.isArray(body.messages) ? body.messages.length : undefined,
-    messageRoles: Array.isArray(body.messages) ? body.messages.map(message => message?.role) : undefined,
-    outputFormatHint,
-    hasJsonSchemaHint: Boolean(jsonSchemaHint),
-    explicitEffort,
-    effortHint,
-    anthropicBeta,
-    resumeConversationKey,
-    persistedConversationKey,
-  });
-
-  const outputConfig =
-    body.output_config && typeof body.output_config === "object" ? body.output_config : {};
-
-  if (!explicitEffort && effortHint && SUPPORTED_EFFORT_HINTS.has(effortHint)) {
-    body.output_config = {
-      ...outputConfig,
-      effort: effortHint,
-    };
-  }
-
-  if (!outputConfig.format && outputFormatHint === "json" && jsonSchemaHint) {
-    body.output_config = {
-      ...body.output_config,
-      format: {
-        type: "json_schema",
-        schema: jsonSchemaHint,
-      },
-    };
-  } else if (!outputConfig.format && outputFormatHint === "json") {
-    body.output_config = {
-      ...body.output_config,
-      format: {
-        type: "json_object",
-      },
-    };
-  }
-
-  return body;
-}
-
 function attachProxyContext(body, headers) {
   if (!body || typeof body !== "object") {
     return body;
@@ -224,20 +67,20 @@ function attachProxyContext(body, headers) {
 
   body._codexProxyCc = {
     cwd: process.cwd(),
-    conversationKey: readPersistedConversationKey(headers),
+    sessionId: readHeaderValue(headers, "x-claude-code-session-id"),
   };
   return body;
 }
 
-export function createGatewayHandler({ config, logger, localToken, openaiClient, backend, sessionStore }) {
+export function createGatewayHandler({ config, logger, localToken, backend, sessionStore }) {
   const selectedBackend = createGatewayBackend({
     config,
     logger,
-    openaiClient,
     backend,
     sessionStore,
   });
-  const appliedContinueSessions = new Set();
+
+  const allowLoopbackWithoutToken = shouldAllowLoopbackWithoutToken(config.server.bind);
 
   return async function gatewayHandler(req, res) {
     const url = parseRequestedUrl(req);
@@ -265,7 +108,7 @@ export function createGatewayHandler({ config, logger, localToken, openaiClient,
         return;
       }
 
-      ensureAuthorized(req, localToken);
+      ensureAuthorized(req, localToken, allowLoopbackWithoutToken);
 
       if (url.pathname === "/v1/models" && req.method === "GET") {
         writeJson(res, 200, {
@@ -278,15 +121,7 @@ export function createGatewayHandler({ config, logger, localToken, openaiClient,
       }
 
       if (url.pathname === "/v1/messages/count_tokens" && req.method === "POST") {
-        const requestBody = applyRequestHints(await readJsonBody(req), req.headers, logger);
-        const body = await maybeApplyContinueHistory({
-          body: requestBody,
-          headers: req.headers,
-          logger,
-          sessionStore,
-          appliedContinueSessions,
-          markApplied: false,
-        });
+        const body = attachProxyContext(await readJsonBody(req), req.headers);
         const tokenCounts = await selectedBackend.countTokens(body);
         writeJson(res, 200, {
           input_tokens: tokenCounts.input_tokens,
@@ -295,18 +130,7 @@ export function createGatewayHandler({ config, logger, localToken, openaiClient,
       }
 
       if (url.pathname === "/v1/messages" && req.method === "POST") {
-        const requestBody = applyRequestHints(await readJsonBody(req), req.headers, logger);
-        const body = attachProxyContext(
-          await maybeApplyContinueHistory({
-            body: requestBody,
-            headers: req.headers,
-            logger,
-            sessionStore,
-            appliedContinueSessions,
-            markApplied: true,
-          }),
-          req.headers,
-        );
+        const body = attachProxyContext(await readJsonBody(req), req.headers);
 
         if (body.stream) {
           await selectedBackend.streamMessage(body, res);
@@ -314,14 +138,6 @@ export function createGatewayHandler({ config, logger, localToken, openaiClient,
         }
 
         const anthropicResponse = await selectedBackend.createMessage(body);
-        const persistedConversation = buildPersistedConversation(body, anthropicResponse);
-        if (persistedConversation) {
-          await sessionStore?.saveRecentConversation({
-            cwd: process.cwd(),
-            conversationKey: body?._codexProxyCc?.conversationKey,
-            messages: persistedConversation,
-          });
-        }
         writeJson(res, 200, anthropicResponse);
         return;
       }
@@ -345,15 +161,13 @@ export async function startGatewayServer({
   config,
   logger,
   localToken,
-  openaiClient,
   backend,
-  sessionStore = createFileSessionStore({ logger }),
+  sessionStore = null,
 }) {
   const handler = createGatewayHandler({
     config,
     logger,
     localToken,
-    openaiClient,
     backend,
     sessionStore,
   });

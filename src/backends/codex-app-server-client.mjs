@@ -13,9 +13,7 @@ const DEFAULT_CAPABILITIES = {
   experimentalApi: false,
   optOutNotificationMethods: [
     "command/exec/outputDelta",
-    "item/agentMessage/delta",
     "item/fileChange/outputDelta",
-    "item/reasoning/summaryTextDelta",
     "item/reasoning/textDelta",
   ],
 };
@@ -72,7 +70,14 @@ export function getCodexLoginStatus(binaryName, cwd = process.cwd()) {
   };
 }
 
-class SpawnedCodexAppServerClient {
+function isClosedStdinError(error) {
+  return (
+    error?.code === "ERR_STREAM_WRITE_AFTER_END" ||
+    error?.code === "EPIPE"
+  );
+}
+
+export class SpawnedCodexAppServerClient {
   constructor(cwd, options = {}) {
     this.cwd = cwd;
     this.options = options;
@@ -81,6 +86,7 @@ class SpawnedCodexAppServerClient {
     this.stderr = "";
     this.closed = false;
     this.notificationHandler = null;
+    this.serverRequestHandler = null;
     this.exitError = null;
     this.exitResolved = false;
     this.exitPromise = new Promise(resolve => {
@@ -90,6 +96,10 @@ class SpawnedCodexAppServerClient {
 
   setNotificationHandler(handler) {
     this.notificationHandler = handler;
+  }
+
+  setServerRequestHandler(handler) {
+    this.serverRequestHandler = handler;
   }
 
   async initialize() {
@@ -102,6 +112,17 @@ class SpawnedCodexAppServerClient {
 
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
+    this.proc.stdin.on("error", error => {
+      if (this.closed && isClosedStdinError(error)) {
+        return;
+      }
+      this.handleExit(
+        createProtocolError("codex app-server stdin failed", {
+          error: error instanceof Error ? error.message : String(error),
+          code: error?.code,
+        }),
+      );
+    });
     this.proc.stderr.on("data", chunk => {
       this.stderr += chunk;
     });
@@ -175,10 +196,7 @@ class SpawnedCodexAppServerClient {
     }
 
     if (message.id !== undefined && message.method) {
-      this.sendMessage({
-        id: message.id,
-        error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`),
-      });
+      this.handleServerRequest(message);
       return;
     }
 
@@ -221,15 +239,54 @@ class SpawnedCodexAppServerClient {
     this.resolveExit();
   }
 
-  sendMessage(message) {
+  async handleServerRequest(message) {
+    const handler = this.serverRequestHandler;
+    if (!handler) {
+      this.sendMessage({
+        id: message.id,
+        error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`),
+      }, { ignoreIfClosed: true });
+      return;
+    }
+
+    try {
+      const result = await handler(message);
+      this.sendMessage({
+        id: message.id,
+        result: result ?? {},
+      }, { ignoreIfClosed: true });
+    } catch (error) {
+      this.sendMessage({
+        id: message.id,
+        error: buildJsonRpcError(
+          -32000,
+          error instanceof Error ? error.message : String(error),
+        ),
+      }, { ignoreIfClosed: true });
+    }
+  }
+
+  sendMessage(message, options = {}) {
+    const { ignoreIfClosed = false } = options;
     const stdin = this.proc?.stdin;
-    if (!stdin) {
+    if (!stdin || this.closed || stdin.destroyed || stdin.writableEnded) {
+      if (ignoreIfClosed) {
+        return false;
+      }
       throw new AppError("codex app-server stdin is not available", {
         status: 500,
         type: "api_error",
       });
     }
-    stdin.write(`${JSON.stringify(message)}\n`);
+    try {
+      stdin.write(`${JSON.stringify(message)}\n`);
+      return true;
+    } catch (error) {
+      if (ignoreIfClosed && isClosedStdinError(error)) {
+        return false;
+      }
+      throw error;
+    }
   }
 
   async close() {
@@ -246,7 +303,7 @@ class SpawnedCodexAppServerClient {
     if (this.proc && !this.proc.killed) {
       this.proc.stdin.end();
       setTimeout(() => {
-        if (this.proc && !this.proc.killed) {
+        if (this.proc && !this.proc.killed && typeof this.proc.kill === "function") {
           this.proc.kill("SIGTERM");
         }
       }, 50).unref?.();

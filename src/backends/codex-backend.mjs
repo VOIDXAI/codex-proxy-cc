@@ -3,42 +3,60 @@ import crypto from "node:crypto";
 import { AppError, makeAnthropicErrorPayload } from "../shared/errors.mjs";
 import { openSse, startPing, writeSseEvent } from "../gateway/sse.mjs";
 import { connectCodexAppServer, getCodexLoginStatus } from "./codex-app-server-client.mjs";
-import { resolveFallbackModelConfig, resolveModelConfig } from "../adapters/model-mapping.mjs";
-import {
-  allowsCompatibilityFallback,
-  allowsLooseCompatibility,
-  isUnsupportedModelError,
-  warnCompatibility,
-} from "../shared/compatibility.mjs";
+import { resolveModelConfig } from "../adapters/model-mapping.mjs";
 
 const SYNTHETIC_OUTPUT_TOOL_NAME = "StructuredOutput";
 
-function unsupportedBlockError(type) {
-  return new AppError(`Unsupported Anthropic content block '${type ?? "unknown"}'`, {
-    status: 400,
-    type: "invalid_request_error",
-  });
+function stringifyBlock(value) {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
 }
 
-function compatibilityTextForBlock(block) {
+function serializeClaudeNativeBlock(block) {
   switch (block?.type) {
     case "server_tool_use":
-      return `[Anthropic server_tool_use omitted: ${block?.name || "unknown"}]`;
+      return [
+        `Anthropic server tool call: ${block?.name || "unknown"}`,
+        block?.id ? `tool_use_id: ${block.id}` : null,
+        block?.input ? `input: ${stringifyBlock(block.input)}` : null,
+      ]
+        .filter(Boolean)
+        .join("\n");
     case "mcp_tool_use":
-      return `[Anthropic mcp_tool_use omitted: ${block?.name || "unknown"}]`;
+      return [
+        `Anthropic MCP tool call: ${block?.name || "unknown"}`,
+        block?.id ? `tool_use_id: ${block.id}` : null,
+        block?.server ? `server: ${block.server}` : null,
+        block?.input ? `input: ${stringifyBlock(block.input)}` : null,
+      ]
+        .filter(Boolean)
+        .join("\n");
     case "document":
       if (typeof block?.text === "string" && block.text.trim()) {
-        return block.text.trim();
+        return `Attached document:\n${block.text.trim()}`;
       }
       if (typeof block?.source?.data === "string" && block.source.data.trim()) {
-        return block.source.data.trim();
+        return `Attached document:\n${block.source.data.trim()}`;
       }
       if (block?.source?.url) {
-        return `[Document URL omitted: ${block.source.url}]`;
+        return `Attached document URL: ${block.source.url}`;
       }
-      return "[Document omitted]";
+      return "Attached document was provided.";
+    case "tool_reference":
+      return [
+        "Deferred Claude tool reference discovered.",
+        block?.tool_name ? `tool_name: ${block.tool_name}` : null,
+      ]
+        .filter(Boolean)
+        .join("\n");
     default:
-      return `[Unsupported Anthropic content block omitted: ${block?.type || "unknown"}]`;
+      return [
+        `Anthropic block: ${block?.type || "unknown"}`,
+        stringifyBlock(block),
+      ].join("\n");
   }
 }
 
@@ -96,7 +114,7 @@ function formatToolResultContent(content) {
   return "";
 }
 
-function describeBlock(block, { config, logger } = {}) {
+function describeBlock(block, { logger } = {}) {
   if (!block) {
     return "";
   }
@@ -130,26 +148,19 @@ function describeBlock(block, { config, logger } = {}) {
         .join("\n");
     case "thinking":
     case "redacted_thinking":
-    case "connector_text":
       return "";
+    case "connector_text":
+      return typeof block.text === "string" ? block.text : "";
     case "server_tool_use":
     case "mcp_tool_use":
     case "document":
-      if (allowsCompatibilityFallback(config)) {
-        warnCompatibility(logger, "Unsupported Anthropic block was downgraded for Codex", {
-          blockType: block.type,
-        });
-        return compatibilityTextForBlock(block);
-      }
-      throw unsupportedBlockError(block.type);
+    case "tool_reference":
+      return serializeClaudeNativeBlock(block);
     default:
-      if (allowsLooseCompatibility(config)) {
-        warnCompatibility(logger, "Unknown Anthropic block was ignored for Codex", {
-          blockType: block.type ?? "unknown",
-        });
-        return "";
-      }
-      throw unsupportedBlockError(block.type);
+      logger?.warn?.("Ignoring unsupported Anthropic content block", {
+        blockType: block?.type || "unknown",
+      });
+      return "";
   }
 }
 
@@ -159,29 +170,29 @@ function isStructuredOutputRetryMessage(content) {
   );
 }
 
-function buildConversationTranscript(messages = [], { config, logger } = {}) {
+function buildConversationTranscript(messages = [], { logger } = {}) {
   return messages
-    .filter(message => {
+    .map(message => {
       const role = message?.role === "assistant" ? "assistant" : "user";
-      if (role !== "user") {
+      const content = normalizeMessageContent(message?.content)
+        .map(block => describeBlock(block, { logger }))
+        .filter(Boolean)
+        .join("\n\n");
+
+      return {
+        role,
+        content,
+      };
+    })
+    .filter(message => {
+      if (message.role !== "user") {
         return true;
       }
 
-      const content = normalizeMessageContent(message?.content)
-        .map(block => describeBlock(block, { config, logger }))
-        .filter(Boolean)
-        .join("\n\n")
-        .trim();
-
-      return !isStructuredOutputRetryMessage(content);
+      return !isStructuredOutputRetryMessage(message.content.trim());
     })
     .map((message, index) => {
-      const role = message?.role === "assistant" ? "assistant" : "user";
-      const content = normalizeMessageContent(message?.content)
-        .map(block => describeBlock(block, { config, logger }))
-        .filter(Boolean)
-        .join("\n\n");
-      return `Message ${index + 1} (${role}):\n${content || "[empty]"}`;
+      return `Message ${index + 1} (${message.role}):\n${message.content || "[empty]"}`;
     })
     .join("\n\n");
 }
@@ -350,6 +361,241 @@ function previewText(text, maxLength = 240) {
   return `${normalized.slice(0, maxLength)}...`;
 }
 
+function isPlainTextContentBlock(block) {
+  return block?.type === "text" && typeof block.text === "string";
+}
+
+function findStructuredOutputToolUseBlock(message) {
+  const content = normalizeMessageContent(message?.content);
+  return (
+    content.find(
+      block => block?.type === "tool_use" && block?.name === SYNTHETIC_OUTPUT_TOOL_NAME && block.input,
+    ) || null
+  );
+}
+
+function canonicalizeAssistantSessionMessage(message) {
+  if (message?.role !== "assistant") {
+    return message;
+  }
+
+  const content = normalizeMessageContent(message.content);
+  const textBlocks = content.filter(isPlainTextContentBlock);
+  if (textBlocks.length > 0) {
+    return {
+      role: "assistant",
+      content: textBlocks,
+    };
+  }
+
+  const structuredOutputBlock = findStructuredOutputToolUseBlock(message);
+  if (structuredOutputBlock) {
+    return {
+      role: "assistant",
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(structuredOutputBlock.input),
+        },
+      ],
+    };
+  }
+
+  return message;
+}
+
+function isStructuredOutputToolResultMessage(message, expectedToolUseId) {
+  if (message?.role !== "user") {
+    return false;
+  }
+
+  const blocks = normalizeMessageContent(message.content);
+  return (
+    blocks.length > 0 &&
+    blocks.every(block => isSuccessfulToolResultBlock(block, expectedToolUseId))
+  );
+}
+
+function canonicalizeMessagesForSession(messages = []) {
+  const normalizedMessages = Array.isArray(messages) ? messages : [];
+  const canonical = [];
+  let pendingStructuredOutputToolUseId = null;
+
+  for (const message of normalizedMessages) {
+    if (!message || typeof message !== "object") {
+      continue;
+    }
+
+    if (
+      pendingStructuredOutputToolUseId &&
+      isStructuredOutputToolResultMessage(message, pendingStructuredOutputToolUseId)
+    ) {
+      pendingStructuredOutputToolUseId = null;
+      continue;
+    }
+
+    const canonicalMessage = canonicalizeAssistantSessionMessage(message);
+    canonical.push(canonicalMessage);
+
+    const structuredOutputBlock =
+      message?.role === "assistant" ? findStructuredOutputToolUseBlock(message) : null;
+    pendingStructuredOutputToolUseId = structuredOutputBlock?.id || null;
+  }
+
+  return canonical;
+}
+
+function cloneSerializable(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function messageFingerprints(messages = []) {
+  return messages.map(message => JSON.stringify(message));
+}
+
+function splitIncrementalMessages(currentMessages = [], previousMessages = []) {
+  if (!Array.isArray(currentMessages) || currentMessages.length === 0) {
+    return null;
+  }
+  if (!Array.isArray(previousMessages) || previousMessages.length === 0) {
+    return null;
+  }
+  if (previousMessages.length >= currentMessages.length) {
+    return null;
+  }
+
+  const currentFingerprints = messageFingerprints(currentMessages);
+  const previousFingerprints = messageFingerprints(previousMessages);
+  for (let index = 0; index < previousFingerprints.length; index += 1) {
+    if (currentFingerprints[index] !== previousFingerprints[index]) {
+      return null;
+    }
+  }
+
+  return currentMessages.slice(previousMessages.length);
+}
+
+function isThinkingEnabled(body) {
+  const thinking = body?.thinking;
+  if (!thinking || typeof thinking !== "object") {
+    return false;
+  }
+  return !thinking.type || thinking.type === "enabled";
+}
+
+function requestCwd(body) {
+  return body?._codexProxyCc?.cwd || process.cwd();
+}
+
+function requestConversationKey(body) {
+  return body?._codexProxyCc?.conversationKey;
+}
+
+function requestSessionId(body) {
+  return body?._codexProxyCc?.sessionId;
+}
+
+function pendingToolSessionKey(body) {
+  return (
+    requestConversationKey(body) ||
+    requestSessionId(body) ||
+    `${requestCwd(body)}::default`
+  );
+}
+
+function filterNativeAnthropicTools(tools = []) {
+  return tools.filter(tool => tool?.name && tool.name !== SYNTHETIC_OUTPUT_TOOL_NAME);
+}
+
+function buildDynamicToolSpecs(tools = []) {
+  return filterNativeAnthropicTools(tools).map(tool => ({
+    name: tool.name,
+    description: tool.description || "",
+    inputSchema: tool.input_schema || {
+      type: "object",
+      properties: {},
+      additionalProperties: true,
+    },
+  }));
+}
+
+function hasNativeAnthropicTools(body) {
+  return buildDynamicToolSpecs(body?.tools || []).length > 0;
+}
+
+function buildToolChoiceInstructions(toolChoice) {
+  if (!toolChoice || typeof toolChoice !== "object") {
+    return "";
+  }
+
+  switch (toolChoice.type) {
+    case "none":
+      return "Do not call any frontend tools for this turn. Respond directly.";
+    case "any":
+      return "You must call at least one frontend tool before your final response.";
+    case "tool":
+      return toolChoice.name
+        ? `You must call the frontend tool '${toolChoice.name}' before your final response.`
+        : "You must call the explicitly selected frontend tool before your final response.";
+    default:
+      return "";
+  }
+}
+
+function buildToolResultContentItems(content) {
+  if (typeof content === "string") {
+    return [{ type: "inputText", text: content }];
+  }
+
+  if (Array.isArray(content)) {
+    const contentItems = [];
+    for (const block of content) {
+      if (block?.type === "text" && typeof block.text === "string") {
+        contentItems.push({ type: "inputText", text: block.text });
+        continue;
+      }
+      if (block?.type === "image" && block?.source?.type === "url" && block.source.url) {
+        contentItems.push({ type: "inputImage", imageUrl: block.source.url });
+        continue;
+      }
+    }
+
+    if (contentItems.length > 0) {
+      return contentItems;
+    }
+
+    return [{ type: "inputText", text: JSON.stringify(content, null, 2) }];
+  }
+
+  if (content && typeof content === "object") {
+    return [{ type: "inputText", text: JSON.stringify(content, null, 2) }];
+  }
+
+  return [{ type: "inputText", text: "" }];
+}
+
+function findLastUserToolResultBlock(messages = [], expectedToolUseId) {
+  const lastMessage = messages[messages.length - 1];
+  if (lastMessage?.role !== "user") {
+    return null;
+  }
+
+  const blocks = normalizeMessageContent(lastMessage.content);
+  return blocks.find(block => block?.type === "tool_result" && block.tool_use_id === expectedToolUseId) || null;
+}
+
+function buildDynamicToolResponseFromAnthropic(body, expectedToolUseId) {
+  const toolResultBlock = findLastUserToolResultBlock(body?.messages || [], expectedToolUseId);
+  if (!toolResultBlock) {
+    return null;
+  }
+
+  return {
+    contentItems: buildToolResultContentItems(toolResultBlock.content),
+    success: toolResultBlock.is_error !== true,
+  };
+}
+
 function buildCodexPromptFromAnthropic(body, config, options = {}) {
   if (!body || typeof body !== "object") {
     throw new AppError("Request body must be a JSON object", {
@@ -371,23 +617,27 @@ function buildCodexPromptFromAnthropic(body, config, options = {}) {
   }
 
   const resolvedModel =
-    options.resolvedModel ||
-    resolveModelConfig(config, body.model, body?.output_config?.effort, {
-      backendType: "codex",
-      logger: options.logger,
-    });
+    options.resolvedModel || resolveModelConfig(config, body.model, body?.output_config?.effort);
   const systemText = normalizeSystemInstructions(body.system);
-  const transcript = buildConversationTranscript(body.messages, {
-    config,
+  const transcriptMessages = canonicalizeMessagesForSession(options.messages || body.messages);
+  const transcript = buildConversationTranscript(transcriptMessages, {
     logger: options.logger,
   });
   const outputInstructions = buildStructuredOutputInstructions(body?.output_config?.format);
   const outputSchema = mapCodexOutputSchema(body?.output_config?.format);
+  const nativeToolBridge = Boolean(options.nativeToolBridge);
+  const toolChoiceInstructions = buildToolChoiceInstructions(body?.tool_choice);
 
   const prompt = [
-    "You are the active Codex agent behind a Claude Code session.",
-    "Take over the task directly in the current workspace using your own tools when needed.",
-    "Do not ask the frontend to execute tools for you.",
+    "You are the model sampler behind a Claude Code session.",
+    "Claude Code remains the source of truth for tools, permissions, remote features, resume state, and all user-facing workflow behavior.",
+    nativeToolBridge
+      ? "Use the provided frontend tools whenever you need to inspect files, run commands, access remote capabilities, or act on the workspace."
+      : "You do not control the workspace directly. Only produce the assistant response that Claude Code should render.",
+    nativeToolBridge
+      ? "If a suitable frontend tool is available, call it instead of relying on any built-in Codex capability."
+      : "Do not invent tool execution that the frontend has not provided.",
+    toolChoiceInstructions,
     "Do not mention backend routing, Anthropic, OpenAI, or internal implementation details.",
     "Return only the assistant response that should be shown to the user.",
     systemText ? `\nSystem instructions:\n${systemText}` : "",
@@ -402,6 +652,7 @@ function buildCodexPromptFromAnthropic(body, config, options = {}) {
     outputSchema,
     externalModel: body.model,
     resolvedModel,
+    transcriptMessages,
   };
 }
 
@@ -430,7 +681,7 @@ function buildAnthropicTextResponse(text, externalModel, usage = {}) {
   };
 }
 
-function buildAnthropicToolUseResponse(toolName, input, externalModel, usage = {}) {
+function buildAnthropicToolUseResponse(toolName, input, externalModel, usage = {}, options = {}) {
   return {
     id: `msg_${crypto.randomUUID()}`,
     type: "message",
@@ -439,7 +690,7 @@ function buildAnthropicToolUseResponse(toolName, input, externalModel, usage = {
     content: [
       {
         type: "tool_use",
-        id: `toolu_${crypto.randomUUID()}`,
+        id: options.toolUseId || `toolu_${crypto.randomUUID()}`,
         name: toolName,
         input,
       },
@@ -563,43 +814,416 @@ function buildPersistedAssistantMessage(response) {
   return null;
 }
 
-async function runCodexTurn({ config, logger, prompt, model, effort, cwd, outputSchema }) {
+async function resolveCodexSessionContext({ body, sessionStore }) {
+  const cwd = requestCwd(body);
+  const conversationKey = requestConversationKey(body);
+  const canonicalMessages = canonicalizeMessagesForSession(body?.messages);
+
+  if (!sessionStore) {
+    return {
+      cwd,
+      conversationKey,
+      canonicalMessages,
+      promptMessages: canonicalMessages,
+      storedConversation: null,
+      resumeThreadId: null,
+      resumeThreadPath: null,
+      resumedFromSnapshot: false,
+    };
+  }
+
+  const storedConversation = await sessionStore.loadRecentConversation({
+    cwd,
+    conversationKey,
+  });
+  const storedMessages = Array.isArray(storedConversation?.messages)
+    ? canonicalizeMessagesForSession(storedConversation.messages)
+    : [];
+  const incrementalMessages = splitIncrementalMessages(canonicalMessages, storedMessages);
+  const canResume =
+    storedConversation?.metadata?.backend === "codex-app-server" &&
+    incrementalMessages &&
+    incrementalMessages.length > 0 &&
+    (storedConversation.metadata.threadId || storedConversation.metadata.threadPath);
+
+  return {
+    cwd,
+    conversationKey,
+    canonicalMessages,
+    promptMessages: canResume ? incrementalMessages : canonicalMessages,
+    storedConversation: storedConversation || null,
+    resumeThreadId: canResume ? storedConversation.metadata.threadId || null : null,
+    resumeThreadPath: canResume ? storedConversation.metadata.threadPath || null : null,
+    resumedFromSnapshot: Boolean(canResume),
+  };
+}
+
+function buildCodexSessionMetadata(metadata = {}) {
+  if (!metadata || typeof metadata !== "object") {
+    return undefined;
+  }
+
+  const backend =
+    typeof metadata.backend === "string" && metadata.backend.trim()
+      ? metadata.backend.trim()
+      : "codex-app-server";
+  const threadId =
+    typeof metadata.threadId === "string" && metadata.threadId.trim()
+      ? metadata.threadId.trim()
+      : undefined;
+  const threadPath =
+    typeof metadata.threadPath === "string" && metadata.threadPath.trim()
+      ? metadata.threadPath.trim()
+      : undefined;
+  const model =
+    typeof metadata.model === "string" && metadata.model.trim() ? metadata.model.trim() : undefined;
+
+  return {
+    backend,
+    ...(threadId ? { threadId } : {}),
+    ...(threadPath ? { threadPath } : {}),
+    ...(model ? { model } : {}),
+  };
+}
+
+async function saveCodexConversationSnapshot({ sessionStore, body, messages, metadata }) {
+  if (!sessionStore || !Array.isArray(messages) || messages.length === 0) {
+    return;
+  }
+
+  await sessionStore.saveRecentConversation({
+    cwd: requestCwd(body),
+    conversationKey: requestConversationKey(body),
+    messages,
+    metadata: buildCodexSessionMetadata(metadata),
+  });
+}
+
+function createDeferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function createCodexTurnAccumulator({ onEvent } = {}) {
+  const agentMessages = new Map();
+  const planMessages = new Map();
+  const reasoningMessages = new Map();
+  const agentOrder = [];
+  const planOrder = [];
+  const reasoningOrder = [];
+  let finalMessage = "";
+  let lastAgentMessage = "";
+  let lastPlanMessage = "";
+
+  function emit(event) {
+    onEvent?.(event);
+  }
+
+  function pushOrder(order, itemId) {
+    if (!order.includes(itemId)) {
+      order.push(itemId);
+    }
+  }
+
+  function ensureAgentMessage(itemId, phase = null) {
+    if (!itemId) {
+      return {
+        id: null,
+        phase,
+        text: "",
+      };
+    }
+    if (!agentMessages.has(itemId)) {
+      agentMessages.set(itemId, {
+        id: itemId,
+        phase,
+        text: "",
+      });
+      pushOrder(agentOrder, itemId);
+    }
+
+    const entry = agentMessages.get(itemId);
+    if (phase && !entry.phase) {
+      entry.phase = phase;
+    }
+    return entry;
+  }
+
+  function ensurePlanMessage(itemId) {
+    if (!itemId) {
+      return {
+        id: null,
+        text: "",
+      };
+    }
+    if (!planMessages.has(itemId)) {
+      planMessages.set(itemId, {
+        id: itemId,
+        text: "",
+      });
+      pushOrder(planOrder, itemId);
+    }
+    return planMessages.get(itemId);
+  }
+
+  function ensureReasoningMessage(itemId) {
+    if (!itemId) {
+      return {
+        id: null,
+        summary: [],
+      };
+    }
+    if (!reasoningMessages.has(itemId)) {
+      reasoningMessages.set(itemId, {
+        id: itemId,
+        summary: [],
+      });
+      pushOrder(reasoningOrder, itemId);
+    }
+    return reasoningMessages.get(itemId);
+  }
+
+  return {
+    noteStartedItem(item) {
+      if (!item || typeof item !== "object") {
+        return;
+      }
+
+      switch (item.type) {
+        case "agentMessage":
+          ensureAgentMessage(item.id, item.phase || null);
+          break;
+        case "plan":
+          ensurePlanMessage(item.id);
+          break;
+        case "reasoning":
+          ensureReasoningMessage(item.id);
+          break;
+        default:
+          break;
+      }
+    },
+    noteAgentMessageDelta({ itemId, delta }) {
+      if (!itemId || !delta) {
+        return;
+      }
+      const entry = ensureAgentMessage(itemId);
+      entry.text += delta;
+      if (entry.text) {
+        lastAgentMessage = entry.text;
+        if (entry.phase === "final_answer") {
+          finalMessage = entry.text;
+        }
+      }
+      emit({
+        type: "agent_message_delta",
+        itemId,
+        phase: entry.phase || null,
+        delta,
+      });
+    },
+    notePlanDelta({ itemId, delta }) {
+      if (!itemId || !delta) {
+        return;
+      }
+      const entry = ensurePlanMessage(itemId);
+      entry.text += delta;
+      if (entry.text) {
+        lastPlanMessage = entry.text;
+      }
+      emit({
+        type: "plan_delta",
+        itemId,
+        delta,
+      });
+    },
+    noteReasoningSummaryPart({ itemId, summaryIndex }) {
+      if (!itemId) {
+        return;
+      }
+      const entry = ensureReasoningMessage(itemId);
+      while (entry.summary.length <= summaryIndex) {
+        entry.summary.push("");
+      }
+    },
+    noteReasoningSummaryDelta({ itemId, summaryIndex, delta }) {
+      if (!itemId || !delta) {
+        return;
+      }
+      const entry = ensureReasoningMessage(itemId);
+      while (entry.summary.length <= summaryIndex) {
+        entry.summary.push("");
+      }
+      entry.summary[summaryIndex] += delta;
+      emit({
+        type: "reasoning_summary_delta",
+        itemId,
+        summaryIndex,
+        delta,
+      });
+    },
+    noteCompletedItem(item) {
+      if (!item || typeof item !== "object") {
+        return;
+      }
+
+      switch (item.type) {
+        case "agentMessage": {
+          const entry = ensureAgentMessage(item.id, item.phase || null);
+          entry.phase = item.phase || entry.phase;
+          entry.text = item.text || entry.text;
+          if (entry.text) {
+            lastAgentMessage = entry.text;
+            if (entry.phase === "final_answer") {
+              finalMessage = entry.text;
+            }
+          }
+          break;
+        }
+        case "plan": {
+          const entry = ensurePlanMessage(item.id);
+          entry.text = item.text || entry.text;
+          if (entry.text) {
+            lastPlanMessage = entry.text;
+          }
+          break;
+        }
+        case "reasoning": {
+          const entry = ensureReasoningMessage(item.id);
+          if (Array.isArray(item.summary)) {
+            entry.summary = [...item.summary];
+          }
+          break;
+        }
+        default:
+          break;
+      }
+
+      emit({
+        type: "item_completed",
+        item: cloneSerializable(item),
+      });
+    },
+    buildResult({ threadId, threadPath, turnId, resumed, usage, stderr, model }) {
+      return {
+        threadId,
+        threadPath,
+        turnId,
+        resumed,
+        model,
+        finalMessage: finalMessage || lastAgentMessage || lastPlanMessage || "",
+        lastAgentMessage,
+        lastPlanMessage,
+        reasoningSummaries: reasoningOrder.flatMap(itemId => {
+          const entry = reasoningMessages.get(itemId);
+          return Array.isArray(entry?.summary) ? entry.summary.filter(Boolean) : [];
+        }),
+        usage,
+        stderr,
+      };
+    },
+  };
+}
+
+async function runCodexTurn({
+  config,
+  logger,
+  prompt,
+  model,
+  effort,
+  cwd,
+  outputSchema,
+  summary = "none",
+  onEvent,
+  threadContext,
+}) {
   const client = await connectCodexAppServer(cwd, {
     command: config.codex.binary,
     env: process.env,
   });
 
   let threadId = null;
+  let threadPath = null;
   let turnId = null;
-  let finalMessage = "";
+  let resumed = false;
   let usage = {
     input_tokens: approximateTokensFromText(prompt),
     output_tokens: 0,
   };
+  const accumulator = createCodexTurnAccumulator({ onEvent });
 
   try {
-    const threadStart = await client.request("thread/start", {
-      cwd,
-      model,
-      approvalPolicy: "never",
-      sandbox: config.codex.sandbox || "workspace-write",
-      serviceName: "codex-proxy-cc",
-      ephemeral: true,
-      experimentalRawEvents: false,
-    });
-    threadId = threadStart.thread?.id || null;
+    const sandbox = config.codex.sandbox || "workspace-write";
+    const resumeThreadId = threadContext?.threadId || threadContext?.resumeThreadId;
+    const resumeThreadPath = threadContext?.threadPath || threadContext?.resumeThreadPath;
+
+    if (resumeThreadId || resumeThreadPath) {
+      const threadResume = await client.request("thread/resume", {
+        threadId: resumeThreadId || "codex-proxy-cc-resume",
+        ...(resumeThreadPath ? { path: resumeThreadPath } : {}),
+        cwd,
+        model,
+        approvalPolicy: "never",
+        sandbox,
+        persistExtendedHistory: true,
+      });
+      threadId = threadResume.thread?.id || resumeThreadId || null;
+      threadPath = threadResume.thread?.path || resumeThreadPath || null;
+      resumed = true;
+    } else {
+      const threadStart = await client.request("thread/start", {
+        cwd,
+        model,
+        approvalPolicy: "never",
+        sandbox,
+        serviceName: "codex-proxy-cc",
+        ephemeral: false,
+        experimentalRawEvents: false,
+        persistExtendedHistory: true,
+      });
+      threadId = threadStart.thread?.id || null;
+      threadPath = threadStart.thread?.path || null;
+    }
 
     const completion = new Promise((resolve, reject) => {
       client.setNotificationHandler(message => {
         try {
           switch (message.method) {
+            case "item/started":
+              accumulator.noteStartedItem(message.params?.item);
+              break;
+            case "item/agentMessage/delta":
+              accumulator.noteAgentMessageDelta({
+                itemId: message.params?.itemId,
+                delta: message.params?.delta || "",
+              });
+              break;
+            case "item/plan/delta":
+              accumulator.notePlanDelta({
+                itemId: message.params?.itemId,
+                delta: message.params?.delta || "",
+              });
+              break;
+            case "item/reasoning/summaryPartAdded":
+              accumulator.noteReasoningSummaryPart({
+                itemId: message.params?.itemId,
+                summaryIndex: message.params?.summaryIndex ?? 0,
+              });
+              break;
+            case "item/reasoning/summaryTextDelta":
+              accumulator.noteReasoningSummaryDelta({
+                itemId: message.params?.itemId,
+                summaryIndex: message.params?.summaryIndex ?? 0,
+                delta: message.params?.delta || "",
+              });
+              break;
             case "item/completed":
-              if (
-                message.params?.item?.type === "agentMessage" &&
-                message.params?.item?.phase === "final_answer"
-              ) {
-                finalMessage = message.params.item.text || finalMessage;
-              }
+              accumulator.noteCompletedItem(message.params?.item);
               break;
             case "thread/tokenUsage/updated": {
               const tokenUsage = message.params?.tokenUsage?.last || message.params?.tokenUsage?.total;
@@ -644,6 +1268,7 @@ async function runCodexTurn({ config, logger, prompt, model, effort, cwd, output
       ],
       model,
       effort,
+      summary,
       outputSchema: outputSchema ?? null,
     });
     turnId = turnStart.turn?.id || null;
@@ -658,25 +1283,340 @@ async function runCodexTurn({ config, logger, prompt, model, effort, cwd, output
 
     logger?.info?.("Codex app-server turn completed", {
       threadId,
+      threadPath,
       turnId,
       model,
       effort,
+      resumed,
     });
 
-  return {
-    threadId,
-    turnId,
-    finalMessage: finalMessage || "",
+    return accumulator.buildResult({
+      threadId,
+      threadPath,
+      turnId,
+      resumed,
+      model,
       usage,
       stderr: client.stderr,
-    };
+    });
   } finally {
     await client.close();
   }
 }
 
-async function runCodexTurnWithFallback({
-  body,
+async function createAppServerCodexTurnController({
+  config,
+  logger,
+  prompt,
+  model,
+  effort,
+  cwd,
+  outputSchema,
+  summary = "none",
+  onEvent,
+  threadContext,
+  dynamicTools = [],
+}) {
+  const client = await connectCodexAppServer(cwd, {
+    command: config.codex.binary,
+    env: process.env,
+    capabilities:
+      dynamicTools.length > 0
+        ? {
+            experimentalApi: true,
+            optOutNotificationMethods: [
+              "command/exec/outputDelta",
+              "item/fileChange/outputDelta",
+              "item/reasoning/textDelta",
+            ],
+          }
+        : undefined,
+  });
+
+  let threadId = null;
+  let threadPath = null;
+  let turnId = null;
+  let resumed = false;
+  let completed = false;
+  let closed = false;
+  let usage = {
+    input_tokens: approximateTokensFromText(prompt),
+    output_tokens: 0,
+  };
+  let eventHandler = onEvent;
+  const accumulator = createCodexTurnAccumulator({
+    onEvent: event => {
+      eventHandler?.(event);
+    },
+  });
+  let stopSignal = createDeferred();
+  let pendingToolRequest = null;
+
+  function resolveStop(payload) {
+    stopSignal.resolve(payload);
+  }
+
+  function rejectStop(error) {
+    stopSignal.reject(error);
+  }
+
+  try {
+    const sandbox = config.codex.sandbox || "workspace-write";
+    const resumeThreadId = threadContext?.threadId || threadContext?.resumeThreadId;
+    const resumeThreadPath = threadContext?.threadPath || threadContext?.resumeThreadPath;
+
+    client.setServerRequestHandler(async message => {
+      if (message.method !== "item/tool/call") {
+        throw new AppError(`Unsupported server request: ${message.method}`, {
+          status: 502,
+          type: "api_error",
+        });
+      }
+
+      const responseSignal = createDeferred();
+      pendingToolRequest = {
+        requestId: message.id,
+        callId: message.params?.callId,
+        tool: message.params?.tool,
+        arguments: message.params?.arguments ?? {},
+        responseSignal,
+      };
+
+      resolveStop({
+        type: "tool_request",
+        toolCall: {
+          id: pendingToolRequest.callId,
+          name: pendingToolRequest.tool,
+          input: pendingToolRequest.arguments,
+        },
+        usage: {
+          ...usage,
+        },
+        threadId,
+        threadPath,
+        turnId,
+        model,
+      });
+
+      return responseSignal.promise;
+    });
+
+    client.setNotificationHandler(message => {
+      try {
+        switch (message.method) {
+          case "item/started":
+            accumulator.noteStartedItem(message.params?.item);
+            break;
+          case "item/agentMessage/delta":
+            accumulator.noteAgentMessageDelta({
+              itemId: message.params?.itemId,
+              delta: message.params?.delta || "",
+            });
+            break;
+          case "item/plan/delta":
+            accumulator.notePlanDelta({
+              itemId: message.params?.itemId,
+              delta: message.params?.delta || "",
+            });
+            break;
+          case "item/reasoning/summaryPartAdded":
+            accumulator.noteReasoningSummaryPart({
+              itemId: message.params?.itemId,
+              summaryIndex: message.params?.summaryIndex ?? 0,
+            });
+            break;
+          case "item/reasoning/summaryTextDelta":
+            accumulator.noteReasoningSummaryDelta({
+              itemId: message.params?.itemId,
+              summaryIndex: message.params?.summaryIndex ?? 0,
+              delta: message.params?.delta || "",
+            });
+            break;
+          case "item/completed":
+            accumulator.noteCompletedItem(message.params?.item);
+            break;
+          case "thread/tokenUsage/updated": {
+            const tokenUsage = message.params?.tokenUsage?.last || message.params?.tokenUsage?.total;
+            if (tokenUsage) {
+              usage = {
+                input_tokens: tokenUsage.inputTokens ?? usage.input_tokens,
+                output_tokens: tokenUsage.outputTokens ?? usage.output_tokens,
+              };
+            }
+            break;
+          }
+          case "error":
+            rejectStop(
+              new AppError(message.params?.error?.message || "Codex app-server turn failed", {
+                status: 502,
+                type: "api_error",
+              }),
+            );
+            break;
+          case "turn/completed": {
+            completed = true;
+            resolveStop({
+              type: "completed",
+              result: accumulator.buildResult({
+                threadId,
+                threadPath,
+                turnId,
+                resumed,
+                model,
+                usage,
+                stderr: client.stderr,
+              }),
+              turn: message.params?.turn || null,
+            });
+            break;
+          }
+          default:
+            break;
+        }
+      } catch (error) {
+        rejectStop(error);
+      }
+    });
+
+    if (resumeThreadId || resumeThreadPath) {
+      const threadResume = await client.request("thread/resume", {
+        threadId: resumeThreadId || "codex-proxy-cc-resume",
+        ...(resumeThreadPath ? { path: resumeThreadPath } : {}),
+        ...(dynamicTools.length > 0 ? { dynamicTools } : {}),
+        cwd,
+        model,
+        approvalPolicy: "never",
+        sandbox,
+        persistExtendedHistory: true,
+      });
+      threadId = threadResume.thread?.id || resumeThreadId || null;
+      threadPath = threadResume.thread?.path || resumeThreadPath || null;
+      resumed = true;
+    } else {
+      const threadStart = await client.request("thread/start", {
+        cwd,
+        model,
+        approvalPolicy: "never",
+        sandbox,
+        serviceName: "codex-proxy-cc",
+        ephemeral: false,
+        experimentalRawEvents: false,
+        persistExtendedHistory: true,
+        ...(dynamicTools.length > 0 ? { dynamicTools } : {}),
+      });
+      threadId = threadStart.thread?.id || null;
+      threadPath = threadStart.thread?.path || null;
+    }
+
+    const turnStart = await client.request("turn/start", {
+      threadId,
+      input: [
+        {
+          type: "text",
+          text: prompt,
+          text_elements: [],
+        },
+      ],
+      model,
+      effort,
+      summary,
+      outputSchema: outputSchema ?? null,
+    });
+    turnId = turnStart.turn?.id || null;
+  } catch (error) {
+    await client.close();
+    throw error;
+  }
+
+  return {
+    async waitForStop() {
+      return stopSignal.promise;
+    },
+    async resumeWithToolResult(toolResult) {
+      if (!pendingToolRequest) {
+        throw new AppError("No pending tool request to resume", {
+          status: 400,
+          type: "invalid_request_error",
+        });
+      }
+
+      const activeRequest = pendingToolRequest;
+      pendingToolRequest = null;
+      stopSignal = createDeferred();
+      activeRequest.responseSignal.resolve(toolResult);
+      return stopSignal.promise;
+    },
+    getPendingToolRequest() {
+      return pendingToolRequest
+        ? {
+            callId: pendingToolRequest.callId,
+            tool: pendingToolRequest.tool,
+            arguments: pendingToolRequest.arguments,
+          }
+        : null;
+    },
+    getMetadata() {
+      return {
+        threadId,
+        threadPath,
+        turnId,
+        model,
+      };
+    },
+    setOnEvent(nextHandler) {
+      eventHandler = nextHandler;
+    },
+    isCompleted() {
+      return completed;
+    },
+    async close() {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      if (pendingToolRequest) {
+        pendingToolRequest.responseSignal.reject(
+          new AppError("Codex tool bridge session was closed before the tool result arrived", {
+            status: 499,
+            type: "api_error",
+          }),
+        );
+        pendingToolRequest = null;
+      }
+      await client.close();
+    },
+  };
+}
+
+async function createCodexTurnController({
+  config,
+  logger,
+  prompt,
+  resolvedModel,
+  cwd,
+  outputSchema,
+  summary,
+  onEvent,
+  threadContext,
+  dynamicTools,
+  createTurnController,
+}) {
+  return createTurnController({
+    config,
+    logger,
+    prompt,
+    model: resolvedModel.targetModel,
+    effort: resolvedModel.effort,
+    cwd,
+    outputSchema,
+    summary,
+    onEvent,
+    threadContext,
+    dynamicTools,
+  });
+}
+
+async function runCodexTurnDirect({
   config,
   logger,
   prompt,
@@ -684,161 +1624,317 @@ async function runCodexTurnWithFallback({
   cwd,
   outputSchema,
   runTurn,
+  summary,
+  onEvent,
+  threadContext,
 }) {
-  try {
-    return await runTurn({
-      config,
-      logger,
-      prompt,
-      model: resolvedModel.openaiModel,
-      effort: resolvedModel.effort,
-      cwd,
-      outputSchema,
-    });
-  } catch (error) {
-    if (!allowsCompatibilityFallback(config) || !isUnsupportedModelError(error)) {
-      throw error;
-    }
-
-    const fallbackModel = resolveFallbackModelConfig(config, resolvedModel, {
-      backendType: "codex",
-    });
-    if (!fallbackModel) {
-      throw error;
-    }
-
-    warnCompatibility(logger, "Retrying Codex turn with fallback model", {
-      fromModel: resolvedModel.openaiModel,
-      toModel: fallbackModel.openaiModel,
-      effort: fallbackModel.effort,
-      externalModel: body?.model,
-    });
-
-    return runTurn({
-      config,
-      logger,
-      prompt,
-      model: fallbackModel.openaiModel,
-      effort: fallbackModel.effort,
-      cwd,
-      outputSchema,
-    });
-  }
-}
-
-function writeSingleTextStream(res, externalModel, text, usage) {
-  const messageId = `msg_${crypto.randomUUID()}`;
-  writeSseEvent(res, "message_start", {
-    type: "message_start",
-    message: {
-      id: messageId,
-      type: "message",
-      role: "assistant",
-      model: externalModel,
-      content: [],
-      stop_reason: null,
-      stop_sequence: null,
-      usage: {
-        input_tokens: 0,
-        output_tokens: 0,
-      },
-    },
-  });
-  writeSseEvent(res, "content_block_start", {
-    type: "content_block_start",
-    index: 0,
-    content_block: {
-      type: "text",
-      text: "",
-    },
-  });
-  if (text) {
-    writeSseEvent(res, "content_block_delta", {
-      type: "content_block_delta",
-      index: 0,
-      delta: {
-        type: "text_delta",
-        text,
-      },
-    });
-  }
-  writeSseEvent(res, "content_block_stop", {
-    type: "content_block_stop",
-    index: 0,
-  });
-  writeSseEvent(res, "message_delta", {
-    type: "message_delta",
-    delta: {
-      stop_reason: "end_turn",
-      stop_sequence: null,
-    },
-    usage: {
-      input_tokens: usage.input_tokens ?? 0,
-      output_tokens: usage.output_tokens ?? approximateTokensFromText(text),
-    },
-  });
-  writeSseEvent(res, "message_stop", {
-    type: "message_stop",
+  return runTurn({
+    config,
+    logger,
+    prompt,
+    model: resolvedModel.targetModel,
+    effort: resolvedModel.effort,
+    cwd,
+    outputSchema,
+    summary,
+    onEvent,
+    threadContext,
   });
 }
 
-function writeToolUseStream(res, externalModel, toolName, input, usage) {
+function createAnthropicStreamWriter(res, externalModel) {
   const messageId = `msg_${crypto.randomUUID()}`;
-  const toolUseId = `toolu_${crypto.randomUUID()}`;
-  const serializedInput = JSON.stringify(input);
+  let started = false;
+  let nextBlockIndex = 0;
+  let activeBlockKey = null;
+  const blocks = new Map();
 
-  writeSseEvent(res, "message_start", {
-    type: "message_start",
-    message: {
-      id: messageId,
-      type: "message",
-      role: "assistant",
-      model: externalModel,
-      content: [],
-      stop_reason: null,
-      stop_sequence: null,
-      usage: {
-        input_tokens: 0,
-        output_tokens: 0,
+  function ensureMessageStart() {
+    if (started) {
+      return;
+    }
+    started = true;
+    writeSseEvent(res, "message_start", {
+      type: "message_start",
+      message: {
+        id: messageId,
+        type: "message",
+        role: "assistant",
+        model: externalModel,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+        },
       },
+    });
+  }
+
+  function stopBlock(key) {
+    const block = blocks.get(key);
+    if (!block || block.closed) {
+      return;
+    }
+    block.closed = true;
+    writeSseEvent(res, "content_block_stop", {
+      type: "content_block_stop",
+      index: block.index,
+    });
+    if (activeBlockKey === key) {
+      activeBlockKey = null;
+    }
+  }
+
+  function ensureBlock(key, type) {
+    ensureMessageStart();
+
+    if (activeBlockKey && activeBlockKey !== key) {
+      stopBlock(activeBlockKey);
+    }
+
+    let block = blocks.get(key);
+    if (block?.closed) {
+      block = null;
+    }
+    if (!block) {
+      block = {
+        index: nextBlockIndex,
+        type,
+        closed: false,
+      };
+      nextBlockIndex += 1;
+      blocks.set(key, block);
+      writeSseEvent(res, "content_block_start", {
+        type: "content_block_start",
+        index: block.index,
+        content_block: (() => {
+          if (type === "thinking") {
+            return {
+              type: "thinking",
+              thinking: "",
+            };
+          }
+          if (type === "tool_use") {
+            return {
+              type: "tool_use",
+              id: key,
+              name: "unknown",
+              input: {},
+            };
+          }
+          return {
+            type: "text",
+            text: "",
+          };
+        })(),
+      });
+    }
+
+    activeBlockKey = key;
+    return block;
+  }
+
+  return {
+    appendText(key, text) {
+      if (!text) {
+        return;
+      }
+      const block = ensureBlock(key, "text");
+      writeSseEvent(res, "content_block_delta", {
+        type: "content_block_delta",
+        index: block.index,
+        delta: {
+          type: "text_delta",
+          text,
+        },
+      });
     },
-  });
-  writeSseEvent(res, "content_block_start", {
-    type: "content_block_start",
-    index: 0,
-    content_block: {
-      type: "tool_use",
-      id: toolUseId,
-      name: toolName,
-      input: {},
+    appendThinking(key, text) {
+      if (!text) {
+        return;
+      }
+      const block = ensureBlock(key, "thinking");
+      writeSseEvent(res, "content_block_delta", {
+        type: "content_block_delta",
+        index: block.index,
+        delta: {
+          type: "thinking_delta",
+          thinking: text,
+        },
+      });
     },
-  });
-  writeSseEvent(res, "content_block_delta", {
-    type: "content_block_delta",
-    index: 0,
-    delta: {
-      type: "input_json_delta",
-      partial_json: serializedInput,
+    appendToolUse(key, { toolUseId, toolName, input }) {
+      ensureMessageStart();
+      if (activeBlockKey && activeBlockKey !== key) {
+        stopBlock(activeBlockKey);
+      }
+
+      const block = {
+        index: nextBlockIndex,
+        type: "tool_use",
+        closed: false,
+      };
+      nextBlockIndex += 1;
+      blocks.set(key, block);
+      activeBlockKey = key;
+
+      writeSseEvent(res, "content_block_start", {
+        type: "content_block_start",
+        index: block.index,
+        content_block: {
+          type: "tool_use",
+          id: toolUseId,
+          name: toolName,
+          input: {},
+        },
+      });
+      writeSseEvent(res, "content_block_delta", {
+        type: "content_block_delta",
+        index: block.index,
+        delta: {
+          type: "input_json_delta",
+          partial_json: JSON.stringify(input ?? {}),
+        },
+      });
+      stopBlock(key);
     },
-  });
-  writeSseEvent(res, "content_block_stop", {
-    type: "content_block_stop",
-    index: 0,
-  });
-  writeSseEvent(res, "message_delta", {
-    type: "message_delta",
-    delta: {
-      stop_reason: "tool_use",
-      stop_sequence: null,
+    stopBlock,
+    finish(usage = {}, stopReason = "end_turn") {
+      ensureMessageStart();
+      if (activeBlockKey) {
+        stopBlock(activeBlockKey);
+      }
+      for (const key of blocks.keys()) {
+        stopBlock(key);
+      }
+      writeSseEvent(res, "message_delta", {
+        type: "message_delta",
+        delta: {
+          stop_reason: stopReason,
+          stop_sequence: null,
+        },
+        usage: {
+          input_tokens: usage.input_tokens ?? 0,
+          output_tokens: usage.output_tokens ?? 0,
+        },
+      });
+      writeSseEvent(res, "message_stop", {
+        type: "message_stop",
+      });
     },
-    usage: {
+  };
+}
+
+function createCodexStreamBridge({ res, externalModel, includeThinking }) {
+  const writer = createAnthropicStreamWriter(res, externalModel);
+  const emittedBlocks = new Set();
+  let emittedContent = false;
+
+  function appendVisibleText(kind, itemId, text) {
+    if (!text) {
+      return;
+    }
+    const key = `${kind}:${itemId}`;
+    emittedContent = true;
+    emittedBlocks.add(key);
+    writer.appendText(key, text);
+  }
+
+  function appendThinkingText(itemId, summaryIndex, text) {
+    if (!includeThinking || !text) {
+      return;
+    }
+    const key = `reasoning:${itemId}:${summaryIndex}`;
+    emittedContent = true;
+    emittedBlocks.add(key);
+    writer.appendThinking(key, text);
+  }
+
+  return {
+    handle(event) {
+      switch (event?.type) {
+        case "plan_delta":
+          appendVisibleText("plan", event.itemId, event.delta);
+          break;
+        case "agent_message_delta":
+          appendVisibleText("agent", event.itemId, event.delta);
+          break;
+        case "reasoning_summary_delta":
+          appendThinkingText(event.itemId, event.summaryIndex, event.delta);
+          break;
+        case "item_completed":
+          if (event.item?.type === "plan") {
+            const key = `plan:${event.item.id}`;
+            if (!emittedBlocks.has(key) && event.item.text) {
+              appendVisibleText("plan", event.item.id, event.item.text);
+            }
+            writer.stopBlock(key);
+          } else if (event.item?.type === "agentMessage") {
+            const key = `agent:${event.item.id}`;
+            if (!emittedBlocks.has(key) && event.item.text) {
+              appendVisibleText("agent", event.item.id, event.item.text);
+            }
+            writer.stopBlock(key);
+          } else if (includeThinking && event.item?.type === "reasoning") {
+            const summaryParts = Array.isArray(event.item.summary) ? event.item.summary : [];
+            summaryParts.forEach((summaryText, summaryIndex) => {
+              const key = `reasoning:${event.item.id}:${summaryIndex}`;
+              if (!emittedBlocks.has(key) && summaryText) {
+                appendThinkingText(event.item.id, summaryIndex, summaryText);
+              }
+              writer.stopBlock(key);
+            });
+          }
+          break;
+        default:
+          break;
+      }
+    },
+    emitFallback({ text, reasoningSummaries = [] } = {}) {
+      if (emittedContent) {
+        return;
+      }
+      reasoningSummaries.forEach((summary, index) => {
+        appendThinkingText("fallback", index, summary);
+      });
+      if (text) {
+        appendVisibleText("agent", "fallback", text);
+      }
+    },
+    emitToolUse(toolCall) {
+      if (!toolCall?.id || !toolCall?.name) {
+        return;
+      }
+      emittedContent = true;
+      writer.appendToolUse(`tool:${toolCall.id}`, {
+        toolUseId: toolCall.id,
+        toolName: toolCall.name,
+        input: toolCall.input ?? {},
+      });
+    },
+    finish(usage, stopReason = "end_turn") {
+      writer.finish(usage, stopReason);
+    },
+  };
+}
+
+function writeToolUseStream(res, externalModel, toolName, input, usage, options = {}) {
+  const writer = createAnthropicStreamWriter(res, externalModel);
+  const toolUseId = options.toolUseId || `toolu_${crypto.randomUUID()}`;
+  writer.appendToolUse(toolUseId, {
+    toolUseId,
+    toolName,
+    input,
+  });
+  writer.finish(
+    {
       input_tokens: usage.input_tokens ?? 0,
-      output_tokens: usage.output_tokens ?? approximateTokensFromText(serializedInput),
+      output_tokens: usage.output_tokens ?? approximateTokensFromText(JSON.stringify(input)),
     },
-  });
-  writeSseEvent(res, "message_stop", {
-    type: "message_stop",
-  });
+    "tool_use",
+  );
 }
 
 function writeEmptyEndTurnStream(res, externalModel, usage) {
@@ -876,181 +1972,634 @@ function writeEmptyEndTurnStream(res, externalModel, usage) {
   });
 }
 
-export function createCodexBackend({ config, logger, runTurn = runCodexTurn, sessionStore } = {}) {
+function ensureCompletedCodexControllerOutcome(outcome) {
+  if (!outcome || outcome.type !== "completed") {
+    return outcome;
+  }
+
+  if (outcome.turn?.status && outcome.turn.status !== "completed") {
+    throw new AppError(`Codex turn ended with status '${outcome.turn.status}'`, {
+      status: 502,
+      type: "api_error",
+    });
+  }
+
+  return outcome;
+}
+
+function buildCodexCompletionArtifacts({ body, externalModel, result }) {
+  const normalizedText = normalizeStructuredOutputText(result.finalMessage, body?.output_config?.format);
+  const structuredOutputTool = findToolByName(body.tools, SYNTHETIC_OUTPUT_TOOL_NAME);
+  const structuredOutputPayload =
+    structuredOutputTool && body?.output_config?.format
+      ? parseStructuredOutputInput(result.finalMessage, body.output_config.format)
+      : null;
+
+  if (structuredOutputTool && structuredOutputPayload) {
+    const response = buildAnthropicToolUseResponse(
+      structuredOutputTool.name,
+      structuredOutputPayload.parsed,
+      externalModel,
+      result.usage,
+    );
+    return {
+      normalizedText,
+      responseKind: "tool_use",
+      response,
+      structuredOutputPayload,
+      structuredOutputTool,
+    };
+  }
+
+  return {
+    normalizedText,
+    responseKind: "text",
+    response: buildAnthropicTextResponse(normalizedText, externalModel, result.usage),
+    structuredOutputPayload: null,
+    structuredOutputTool: null,
+  };
+}
+
+function buildCompletedCodexMetadata(result, resolvedModel) {
+  return {
+    backend: "codex-app-server",
+    threadId: result.threadId,
+    threadPath: result.threadPath,
+    model: result.model || resolvedModel.targetModel,
+  };
+}
+
+async function persistCodexAssistantResponse({
+  sessionStore,
+  body,
+  canonicalMessages,
+  response,
+  metadata,
+}) {
+  const persistedAssistant = buildPersistedAssistantMessage(response);
+  await saveCodexConversationSnapshot({
+    sessionStore,
+    body,
+    messages: persistedAssistant ? [...canonicalMessages, persistedAssistant] : canonicalMessages,
+    metadata,
+  });
+}
+
+export function createCodexBackend({
+  config,
+  logger,
+  runTurn = runCodexTurn,
+  sessionStore,
+  createTurnController = createAppServerCodexTurnController,
+} = {}) {
+  const pendingToolSessions = new Map();
+
+  async function closePendingToolSession(key) {
+    const pendingSession = pendingToolSessions.get(key);
+    if (!pendingSession) {
+      return;
+    }
+
+    pendingToolSessions.delete(key);
+    await pendingSession.controller.close();
+  }
+
+  async function awaitControllerStop(stopPromise) {
+    return ensureCompletedCodexControllerOutcome(await stopPromise);
+  }
+
+  async function continuePendingToolSession(body, onEvent) {
+    const key = pendingToolSessionKey(body);
+    const pendingSession = pendingToolSessions.get(key);
+    if (!pendingSession) {
+      return null;
+    }
+
+    pendingSession.controller.setOnEvent(onEvent);
+    const toolResult = buildDynamicToolResponseFromAnthropic(body, pendingSession.toolCall.id);
+    if (!toolResult) {
+      logger?.warn?.("Discarding stale pending Codex tool bridge session without a matching tool_result", {
+        sessionKey: key,
+        expectedToolUseId: pendingSession.toolCall.id,
+      });
+      await closePendingToolSession(key);
+      return null;
+    }
+
+    try {
+      const outcome = await awaitControllerStop(pendingSession.controller.resumeWithToolResult(toolResult));
+      if (outcome.type === "tool_request") {
+        pendingSession.toolCall = outcome.toolCall;
+        pendingToolSessions.set(key, pendingSession);
+      } else {
+        pendingToolSessions.delete(key);
+      }
+
+      return {
+        key,
+        controller: pendingSession.controller,
+        outcome,
+      };
+    } catch (error) {
+      await closePendingToolSession(key);
+      throw error;
+    }
+  }
+
+  async function startToolBridgeTurn({
+    body,
+    sessionContext,
+    prompt,
+    outputSchema,
+    resolvedModel,
+    thinkingEnabled,
+    onEvent,
+  }) {
+    const dynamicTools = buildDynamicToolSpecs(body?.tools || []);
+    const controller = await createCodexTurnController({
+      config,
+      logger,
+      prompt,
+      resolvedModel,
+      cwd: sessionContext.cwd,
+      outputSchema,
+      summary: thinkingEnabled ? "concise" : "none",
+      onEvent,
+      threadContext: {
+        threadId: sessionContext.resumeThreadId,
+        threadPath: sessionContext.resumeThreadPath,
+      },
+      dynamicTools,
+      createTurnController,
+    });
+
+    try {
+      return {
+        controller,
+        outcome: await awaitControllerStop(controller.waitForStop()),
+      };
+    } catch (error) {
+      await controller.close();
+      throw error;
+    }
+  }
+
   return {
     kind: "codex-app-server",
     async countTokens(body) {
-      const { prompt } = buildCodexPromptFromAnthropic(body, config, { logger });
+      const toolBridgeEnabled = hasNativeAnthropicTools(body);
+      const sessionContext = await resolveCodexSessionContext({
+        body,
+        sessionStore,
+      });
+      const { prompt } = buildCodexPromptFromAnthropic(body, config, {
+        logger,
+        messages: sessionContext.promptMessages,
+        nativeToolBridge: toolBridgeEnabled,
+      });
       return {
         input_tokens: approximateTokensFromText(prompt),
       };
     },
     async createMessage(body) {
-      const persistedConversationKey = body?._codexProxyCc?.conversationKey;
-      const { prompt, outputSchema, externalModel, resolvedModel } = buildCodexPromptFromAnthropic(
+      const pendingOutcome = await continuePendingToolSession(body, undefined);
+      if (pendingOutcome) {
+        const { controller, outcome } = pendingOutcome;
+        if (outcome.type === "tool_request") {
+          return buildAnthropicToolUseResponse(
+            outcome.toolCall.name,
+            outcome.toolCall.input,
+            body.model,
+            outcome.usage,
+            {
+              toolUseId: outcome.toolCall.id,
+            },
+          );
+        }
+
+        const completion = buildCodexCompletionArtifacts({
+          body,
+          externalModel: body.model,
+          result: outcome.result,
+        });
+        if (body?.output_config?.format) {
+          logger?.debug?.("Structured output normalization", {
+            raw: previewText(outcome.result.finalMessage),
+            normalized: previewText(completion.normalizedText),
+          });
+        }
+        if (completion.responseKind === "tool_use") {
+          logger?.debug?.("Returning StructuredOutput tool_use response", {
+            model: body.model,
+            tool: completion.structuredOutputTool.name,
+          });
+        }
+        try {
+          await persistCodexAssistantResponse({
+            sessionStore,
+            body,
+            canonicalMessages: canonicalizeMessagesForSession(body?.messages),
+            response: completion.response,
+            metadata: buildCompletedCodexMetadata(outcome.result, {
+              targetModel: outcome.result.model || controller.getMetadata().model || body.model,
+            }),
+          });
+          return completion.response;
+        } finally {
+          await controller.close();
+        }
+      }
+
+      const sessionContext = await resolveCodexSessionContext({
         body,
-        config,
-        { logger },
-      );
+        sessionStore,
+      });
+      const toolBridgeEnabled = hasNativeAnthropicTools(body);
+      const { prompt, outputSchema, externalModel, resolvedModel } = buildCodexPromptFromAnthropic(body, config, {
+        logger,
+        messages: sessionContext.promptMessages,
+        nativeToolBridge: toolBridgeEnabled,
+      });
       if (shouldFinalizeStructuredOutputTurn(body.messages)) {
         logger?.debug?.("Finalizing structured output turn without another Codex request", {
           model: body.model,
         });
+        await saveCodexConversationSnapshot({
+          sessionStore,
+          body,
+          messages: sessionContext.canonicalMessages,
+          metadata: sessionContext.storedConversation?.metadata,
+        });
         return buildAnthropicEmptyResponse(externalModel);
       }
 
-      const result = await runCodexTurnWithFallback({
-        body,
+      if (toolBridgeEnabled) {
+        const { controller, outcome } = await startToolBridgeTurn({
+          body,
+          sessionContext,
+          prompt,
+          outputSchema,
+          resolvedModel,
+          thinkingEnabled: isThinkingEnabled(body),
+        });
+
+        if (outcome.type === "tool_request") {
+          pendingToolSessions.set(pendingToolSessionKey(body), {
+            controller,
+            toolCall: outcome.toolCall,
+          });
+          return buildAnthropicToolUseResponse(
+            outcome.toolCall.name,
+            outcome.toolCall.input,
+            externalModel,
+            outcome.usage,
+            {
+              toolUseId: outcome.toolCall.id,
+            },
+          );
+        }
+
+        const completion = buildCodexCompletionArtifacts({
+          body,
+          externalModel,
+          result: outcome.result,
+        });
+        if (body?.output_config?.format) {
+          logger?.debug?.("Structured output normalization", {
+            raw: previewText(outcome.result.finalMessage),
+            normalized: previewText(completion.normalizedText),
+          });
+        }
+        if (completion.responseKind === "tool_use") {
+          logger?.debug?.("Returning StructuredOutput tool_use response", {
+            model: body.model,
+            tool: completion.structuredOutputTool.name,
+          });
+        }
+        try {
+          await persistCodexAssistantResponse({
+            sessionStore,
+            body,
+            canonicalMessages: sessionContext.canonicalMessages,
+            response: completion.response,
+            metadata: buildCompletedCodexMetadata(outcome.result, resolvedModel),
+          });
+          return completion.response;
+        } finally {
+          await controller.close();
+        }
+      }
+
+      const result = await runCodexTurnDirect({
         config,
         logger,
         prompt,
         resolvedModel,
-        cwd: process.cwd(),
+        cwd: sessionContext.cwd,
         outputSchema,
         runTurn,
+        summary: isThinkingEnabled(body) ? "concise" : "none",
+        threadContext: {
+          threadId: sessionContext.resumeThreadId,
+          threadPath: sessionContext.resumeThreadPath,
+        },
       });
-      const normalizedText = normalizeStructuredOutputText(result.finalMessage, body?.output_config?.format);
+      const completion = buildCodexCompletionArtifacts({
+        body,
+        externalModel,
+        result,
+      });
       if (body?.output_config?.format) {
         logger?.debug?.("Structured output normalization", {
           raw: previewText(result.finalMessage),
-          normalized: previewText(normalizedText),
+          normalized: previewText(completion.normalizedText),
         });
       }
-      const structuredOutputTool = findToolByName(body.tools, SYNTHETIC_OUTPUT_TOOL_NAME);
-      const structuredOutputPayload =
-        structuredOutputTool && body?.output_config?.format
-          ? parseStructuredOutputInput(result.finalMessage, body.output_config.format)
-          : null;
-      if (structuredOutputTool && structuredOutputPayload) {
+      if (completion.responseKind === "tool_use") {
         logger?.debug?.("Returning StructuredOutput tool_use response", {
           model: body.model,
-          tool: structuredOutputTool.name,
-        });
-        const response = buildAnthropicToolUseResponse(
-          structuredOutputTool.name,
-          structuredOutputPayload.parsed,
-          externalModel,
-          result.usage,
-        );
-        const persistedAssistant = buildPersistedAssistantMessage(response);
-        if (persistedAssistant) {
-          await sessionStore?.saveRecentConversation({
-            cwd: process.cwd(),
-            conversationKey: persistedConversationKey,
-            messages: [...body.messages, persistedAssistant],
-          });
-        }
-        return response;
-      }
-      const response = buildAnthropicTextResponse(
-        normalizedText,
-        externalModel,
-        result.usage,
-      );
-      const persistedAssistant = buildPersistedAssistantMessage(response);
-      if (persistedAssistant) {
-        await sessionStore?.saveRecentConversation({
-          cwd: process.cwd(),
-          conversationKey: persistedConversationKey,
-          messages: [...body.messages, persistedAssistant],
+          tool: completion.structuredOutputTool.name,
         });
       }
-      return response;
+      await persistCodexAssistantResponse({
+        sessionStore,
+        body,
+        canonicalMessages: sessionContext.canonicalMessages,
+        response: completion.response,
+        metadata: buildCompletedCodexMetadata(result, resolvedModel),
+      });
+      return completion.response;
     },
     async streamMessage(body, res) {
-      const persistedConversationKey = body?._codexProxyCc?.conversationKey;
-      const { prompt, outputSchema, externalModel, resolvedModel } = buildCodexPromptFromAnthropic(
-        body,
-        config,
-        { logger },
-      );
+      const thinkingEnabled = isThinkingEnabled(body);
+      const toolBridgeEnabled = hasNativeAnthropicTools(body);
+
       openSse(res);
       const ping = startPing(res);
 
       try {
+        const pendingStreamBridge = createCodexStreamBridge({
+          res,
+          externalModel: body.model,
+          includeThinking: thinkingEnabled,
+        });
+        const pendingStructuredOutputTool = findToolByName(body.tools, SYNTHETIC_OUTPUT_TOOL_NAME);
+        const useBufferedPendingStructuredOutput = Boolean(
+          pendingStructuredOutputTool && body?.output_config?.format,
+        );
+        const pendingOutcome = await continuePendingToolSession(
+          body,
+          useBufferedPendingStructuredOutput ? undefined : event => pendingStreamBridge.handle(event),
+        );
+        if (pendingOutcome) {
+          const { controller, outcome } = pendingOutcome;
+          if (outcome.type === "tool_request") {
+            pendingStreamBridge.emitToolUse(outcome.toolCall);
+            pendingStreamBridge.finish(outcome.usage, "tool_use");
+            return;
+          }
+
+          const completion = buildCodexCompletionArtifacts({
+            body,
+            externalModel: body.model,
+            result: outcome.result,
+          });
+          if (body?.output_config?.format) {
+            logger?.debug?.("Structured output normalization", {
+              raw: previewText(outcome.result.finalMessage),
+              normalized: previewText(completion.normalizedText),
+            });
+          }
+          try {
+            await persistCodexAssistantResponse({
+              sessionStore,
+              body,
+              canonicalMessages: canonicalizeMessagesForSession(body?.messages),
+              response: completion.response,
+                metadata: buildCompletedCodexMetadata(outcome.result, {
+                  targetModel: outcome.result.model || controller.getMetadata().model || body.model,
+                }),
+            });
+          } finally {
+            await controller.close();
+          }
+
+          if (completion.responseKind === "tool_use") {
+            logger?.debug?.("Returning StructuredOutput tool_use stream", {
+              model: body.model,
+              tool: completion.structuredOutputTool.name,
+            });
+            writeToolUseStream(
+              res,
+              body.model,
+              completion.structuredOutputTool.name,
+              completion.structuredOutputPayload.parsed,
+              outcome.result.usage,
+              {
+                toolUseId: completion.response.content[0]?.id,
+              },
+            );
+            return;
+          }
+
+          pendingStreamBridge.emitFallback({
+            text: completion.normalizedText,
+            reasoningSummaries: thinkingEnabled ? outcome.result.reasoningSummaries : [],
+          });
+          pendingStreamBridge.finish(outcome.result.usage);
+          return;
+        }
+
+        const sessionContext = await resolveCodexSessionContext({
+          sessionStore,
+          body,
+        });
+        const { prompt, outputSchema, externalModel, resolvedModel } = buildCodexPromptFromAnthropic(body, config, {
+          logger,
+          messages: sessionContext.promptMessages,
+          nativeToolBridge: toolBridgeEnabled,
+        });
         if (shouldFinalizeStructuredOutputTurn(body.messages)) {
           logger?.debug?.("Finalizing structured output turn without another Codex request", {
             model: body.model,
             stream: true,
           });
+          await saveCodexConversationSnapshot({
+            sessionStore,
+            body,
+            messages: sessionContext.canonicalMessages,
+            metadata: sessionContext.storedConversation?.metadata,
+          });
           writeEmptyEndTurnStream(res, externalModel, {});
           return;
         }
 
-        const result = await runCodexTurnWithFallback({
-          body,
+        const structuredOutputTool = findToolByName(body.tools, SYNTHETIC_OUTPUT_TOOL_NAME);
+        const useBufferedStructuredOutput = Boolean(structuredOutputTool && body?.output_config?.format);
+        const streamBridge = !useBufferedStructuredOutput
+          ? createCodexStreamBridge({
+              res,
+              externalModel,
+              includeThinking: thinkingEnabled,
+            })
+          : null;
+
+        if (toolBridgeEnabled) {
+          const { controller, outcome } = await startToolBridgeTurn({
+            body,
+            sessionContext,
+            prompt,
+            outputSchema,
+            resolvedModel,
+            thinkingEnabled,
+            onEvent: streamBridge ? event => streamBridge.handle(event) : undefined,
+          });
+
+          if (outcome.type === "tool_request") {
+            pendingToolSessions.set(pendingToolSessionKey(body), {
+              controller,
+              toolCall: outcome.toolCall,
+            });
+
+            if (streamBridge) {
+              streamBridge.emitToolUse(outcome.toolCall);
+              streamBridge.finish(outcome.usage, "tool_use");
+            } else {
+              writeToolUseStream(
+                res,
+                externalModel,
+                outcome.toolCall.name,
+                outcome.toolCall.input,
+                outcome.usage,
+                {
+                  toolUseId: outcome.toolCall.id,
+                },
+              );
+            }
+            return;
+          }
+
+          const completion = buildCodexCompletionArtifacts({
+            body,
+            externalModel,
+            result: outcome.result,
+          });
+          if (body?.output_config?.format) {
+            logger?.debug?.("Structured output normalization", {
+              raw: previewText(outcome.result.finalMessage),
+              normalized: previewText(completion.normalizedText),
+            });
+          }
+          try {
+            await persistCodexAssistantResponse({
+              sessionStore,
+              body,
+              canonicalMessages: sessionContext.canonicalMessages,
+              response: completion.response,
+              metadata: buildCompletedCodexMetadata(outcome.result, resolvedModel),
+            });
+          } finally {
+            await controller.close();
+          }
+
+          if (completion.responseKind === "tool_use") {
+            logger?.debug?.("Returning StructuredOutput tool_use stream", {
+              model: body.model,
+              tool: completion.structuredOutputTool.name,
+            });
+            writeToolUseStream(
+              res,
+              externalModel,
+              completion.structuredOutputTool.name,
+              completion.structuredOutputPayload.parsed,
+              outcome.result.usage,
+              {
+                toolUseId: completion.response.content[0]?.id,
+              },
+            );
+            return;
+          }
+
+          if (streamBridge) {
+            streamBridge.emitFallback({
+              text: completion.normalizedText,
+              reasoningSummaries: thinkingEnabled ? outcome.result.reasoningSummaries : [],
+            });
+            streamBridge.finish(outcome.result.usage);
+          } else {
+            const fallbackWriter = createAnthropicStreamWriter(res, externalModel);
+            if (completion.normalizedText) {
+              fallbackWriter.appendText("agent:fallback", completion.normalizedText);
+            }
+            fallbackWriter.finish(outcome.result.usage, "end_turn");
+          }
+          return;
+        }
+
+        const result = await runCodexTurnDirect({
           config,
           logger,
           prompt,
           resolvedModel,
-          cwd: process.cwd(),
+          cwd: sessionContext.cwd,
           outputSchema,
           runTurn,
+          summary: thinkingEnabled ? "concise" : "none",
+          threadContext: {
+            threadId: sessionContext.resumeThreadId,
+            threadPath: sessionContext.resumeThreadPath,
+          },
+          onEvent: streamBridge ? event => streamBridge.handle(event) : undefined,
         });
-        const normalizedText = normalizeStructuredOutputText(result.finalMessage, body?.output_config?.format);
+        const completion = buildCodexCompletionArtifacts({
+          body,
+          externalModel,
+          result,
+        });
         if (body?.output_config?.format) {
           logger?.debug?.("Structured output normalization", {
             raw: previewText(result.finalMessage),
-            normalized: previewText(normalizedText),
+            normalized: previewText(completion.normalizedText),
           });
         }
-        const structuredOutputTool = findToolByName(body.tools, SYNTHETIC_OUTPUT_TOOL_NAME);
-        const structuredOutputPayload =
-          structuredOutputTool && body?.output_config?.format
-            ? parseStructuredOutputInput(result.finalMessage, body.output_config.format)
-            : null;
-        if (structuredOutputTool && structuredOutputPayload) {
+        if (completion.responseKind === "tool_use") {
           logger?.debug?.("Returning StructuredOutput tool_use stream", {
             model: body.model,
-            tool: structuredOutputTool.name,
+            tool: completion.structuredOutputTool.name,
           });
-          await sessionStore?.saveRecentConversation({
-            cwd: process.cwd(),
-            conversationKey: persistedConversationKey,
-            messages: [
-              ...body.messages,
-              {
-                role: "assistant",
-                content: [
-                  {
-                    type: "text",
-                    text: JSON.stringify(structuredOutputPayload.parsed),
-                  },
-                ],
-              },
-            ],
-          });
+        }
+        await persistCodexAssistantResponse({
+          sessionStore,
+          body,
+          canonicalMessages: sessionContext.canonicalMessages,
+          response: completion.response,
+          metadata: buildCompletedCodexMetadata(result, resolvedModel),
+        });
+
+        if (completion.responseKind === "tool_use") {
           writeToolUseStream(
             res,
             externalModel,
-            structuredOutputTool.name,
-            structuredOutputPayload.parsed,
+            completion.structuredOutputTool.name,
+            completion.structuredOutputPayload.parsed,
             result.usage,
-          );
-          return;
-        }
-        await sessionStore?.saveRecentConversation({
-          cwd: process.cwd(),
-          conversationKey: persistedConversationKey,
-          messages: [
-            ...body.messages,
             {
-              role: "assistant",
-              content: [
-                {
-                  type: "text",
-                  text: normalizedText,
-                },
-              ],
+              toolUseId: completion.response.content[0]?.id,
             },
-          ],
-        });
-        writeSingleTextStream(
-          res,
-          externalModel,
-          normalizedText,
-          result.usage,
-        );
+          );
+        } else if (streamBridge) {
+          streamBridge.emitFallback({
+            text: completion.normalizedText,
+            reasoningSummaries: thinkingEnabled ? result.reasoningSummaries : [],
+          });
+          streamBridge.finish(result.usage);
+        } else {
+          const fallbackWriter = createAnthropicStreamWriter(res, externalModel);
+          if (completion.normalizedText) {
+            fallbackWriter.appendText("agent:fallback", completion.normalizedText);
+          }
+          fallbackWriter.finish(result.usage, "end_turn");
+        }
       } catch (error) {
         writeSseEvent(res, "error", makeAnthropicErrorPayload(error));
       } finally {

@@ -1,11 +1,4 @@
 export const DEFAULT_CONFIG = {
-  backend: {
-    type: "auto",
-  },
-  openai: {
-    baseUrl: "https://api.openai.com/v1",
-    apiKeyEnv: "OPENAI_API_KEY",
-  },
   codex: {
     binary: "codex",
     sandbox: "workspace-write",
@@ -21,32 +14,29 @@ export const DEFAULT_CONFIG = {
   logging: {
     level: "info",
   },
-  compatibility: {
-    mode: "balanced",
-  },
   profiles: {
-    fast: {
+    haiku: {
       model: "gpt-5-mini",
       codexModel: "gpt-5.4-mini",
       effort: "low",
     },
-    balanced: {
+    sonnet: {
       model: "gpt-5.4",
       codexModel: "gpt-5.4",
       effort: "medium",
     },
-    deep: {
+    opus: {
       model: "gpt-5.4-pro",
       codexModel: "gpt-5.4",
       effort: "high",
     },
   },
   anthropic: {
-    defaultProfile: "balanced",
+    defaultProfile: "sonnet",
     modelMap: {
-      "claude-haiku-*": "fast",
-      "claude-sonnet-*": "balanced",
-      "claude-opus-*": "deep",
+      "claude-haiku-*": "haiku",
+      "claude-sonnet-*": "sonnet",
+      "claude-opus-*": "opus",
     },
     effortMap: {
       low: "low",
@@ -56,9 +46,9 @@ export const DEFAULT_CONFIG = {
     },
   },
   privacy: {
-    disableNonEssentialTraffic: true,
-    disableTelemetry: true,
-    disableErrorReporting: true,
-    disableFeedbackCommand: true,
+    disableNonEssentialTraffic: false,
+    disableTelemetry: false,
+    disableErrorReporting: false,
+    disableFeedbackCommand: false,
   },
 };

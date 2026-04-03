@@ -1,53 +1,56 @@
 # codex-proxy-cc
 
-Run Claude Code through a local Anthropic-compatible gateway backed by Codex OAuth or the OpenAI Responses API.
+Run Claude Code through a local Anthropic-compatible gateway that keeps Claude Code native and swaps only the model sampler to Codex.
 
-`codex-proxy-cc` keeps the Claude Code CLI you already know, but swaps the model runtime behind the scenes so your main Claude Code session can run on Codex instead of Anthropic.
+`codex-proxy-cc` is now intentionally narrow:
+
+- Claude Code stays in charge of tools, permissions, remote control, plan mode, MCP, resume, and UI behavior
+- the proxy only injects a local Anthropic base URL and forwards Claude-shaped requests to a Codex-backed runtime
+- runtime support is Codex-only
 
 ## TL;DR
 
-Install it, then launch Claude Code through the proxy:
-
 ```bash
+codex login status
 codex-proxy-cc
 ```
 
-That is the default daily-use command. Everything else in this README is for choosing a backend, debugging, or customizing routing.
+That is the main daily-use command.
 
 ## Status
 
-The mainline workflow is already usable today:
+The current mainline is designed around Claude Code `v2.1.88` source behavior and focuses on preserving native Claude Code experience while replacing the model runtime.
 
-- Claude Code print mode
+Working today:
+
 - interactive TUI sessions
-- streaming responses
-- tool use and tool results
-- structured JSON output
-- `-c`, `--resume`, and same-directory session recovery
-- recent-session inspection with `codex-proxy-cc sessions`
+- print mode
+- native `tool_use` / `tool_result` bridging
+- streaming text responses
+- `/plan` text streaming and reasoning summary streaming
+- structured JSON output through Claude-style `output_config`
+- Claude Code-owned `-c` / `--resume` flows
 
-## Why You Would Use This
+Not a goal:
 
-- keep using the Claude Code CLI you already know
-- route the main conversation through Codex instead of Anthropic
-- preserve Claude-shaped model names like `haiku`, `sonnet`, and `opus`
-- keep print mode, streaming, tool calls, structured output, and resume flows working through one local proxy
-- inspect recent proxy sessions when you need to continue the right conversation
+- OpenAI API fallback mode
+- proxy-owned session recovery or `sessions` inspection
+- broad Anthropic-provider emulation beyond what Claude Code itself needs
 
 ## What It Does
 
-- starts a local Anthropic-compatible gateway on `127.0.0.1`
+- starts a local gateway on `127.0.0.1`
 - points Claude Code at that gateway with `ANTHROPIC_BASE_URL`
-- authenticates the local gateway with a generated local token
-- prefers your local `codex login` OAuth session when available
-- falls back to the OpenAI Responses API when you explicitly want API-key mode
-- keeps local recent-conversation snapshots so `-c`, `--resume`, and same-directory session recovery still work across fresh launches
+- allows loopback Claude Code traffic by default and still supports a generated local token for non-loopback gateway binds
+- forwards Claude Code requests with minimal mutation
+- bridges Codex dynamic tool calls back into Claude Code native tool loops
 
-This project is intentionally strict about provider routing:
+## Why Use It
 
-- no automatic fallback back to Anthropic
-- no direct `codex app-server` bridge inside Claude Code
-- no promise of full Anthropic feature parity
+- keep Claude Code’s native UX instead of replacing it with a different agent shell
+- keep Claude Code tool permissions, remote features, and local workflows
+- route the actual model sampling through Codex
+- keep Claude-shaped model aliases like `haiku`, `sonnet`, and `opus`
 
 ## Install
 
@@ -67,28 +70,6 @@ npm install -g git+https://github.com/VOIDXAI/codex-proxy-cc.git
 rehash
 ```
 
-If your shell still says `command not found`, open a new terminal or run:
-
-```bash
-rehash
-```
-
-## Quick Start
-
-Codex OAuth mode:
-
-```bash
-codex login status
-codex-proxy-cc --backend codex
-```
-
-OpenAI API mode:
-
-```bash
-export OPENAI_API_KEY=your_key_here
-codex-proxy-cc --backend openai
-```
-
 ## Basic Usage
 
 Default launch:
@@ -97,147 +78,73 @@ Default launch:
 codex-proxy-cc
 ```
 
-Interactive TUI launches keep the terminal clean by default. Proxy runtime logs are written to:
-
-```text
-~/.local/state/codex-proxy-cc/runtime.log
-```
-
-Health check:
+Print mode:
 
 ```bash
-codex-proxy-cc doctor --backend codex
+codex-proxy-cc -- -p --model sonnet
 ```
 
-Pass proxy flags first, then raw Claude Code flags after `--`:
+Health and wiring check:
 
 ```bash
-codex-proxy-cc --backend codex --compatibility-mode balanced -- -p --model opus --effort max
-```
-
-- before `--`: `codex-proxy-cc` options
-- after `--`: Claude Code options, passed through
-
-Useful commands:
-
-```bash
-codex-proxy-cc
-codex-proxy-cc run -- --dangerously-skip-permissions
 codex-proxy-cc doctor
-codex-proxy-cc doctor --verbose
+```
+
+Inspect effective config:
+
+```bash
 codex-proxy-cc config
-codex-proxy-cc sessions
+codex-proxy-cc config --json
+```
+
+Run only the gateway:
+
+```bash
 codex-proxy-cc gateway
 ```
 
-## Common Flows
+Proxy flags go before `--`. Raw Claude Code flags go after `--`.
 
-Use Codex OAuth explicitly:
+## Commands
 
-```bash
-codex-proxy-cc --backend codex -- -p --model sonnet
-```
+- `codex-proxy-cc`
+- `codex-proxy-cc run`
+- `codex-proxy-cc gateway`
+- `codex-proxy-cc doctor`
+- `codex-proxy-cc config`
 
-Use the OpenAI API explicitly:
+## Options
 
-```bash
-codex-proxy-cc --backend openai -- -p --model opus
-```
-
-Let proxy defaults win over Claude's saved local effort:
-
-```bash
-codex-proxy-cc --claude-effort-level unset --backend codex -- -p --model opus
-```
-
-Inspect stored proxy sessions:
-
-```bash
-codex-proxy-cc sessions
-```
-
-Target a specific same-directory snapshot while using bare `-c`:
-
-```bash
-codex-proxy-cc --continue-session 11111111-1111-4111-8111-111111111111 -- -p -c
-```
-
-Resume a deterministic same-directory session directly through Claude flags:
-
-```bash
-codex-proxy-cc --backend codex -- -p --session-id 11111111-1111-4111-8111-111111111111
-codex-proxy-cc --backend codex -- -p --resume 11111111-1111-4111-8111-111111111111
-```
+- `--config <path>`
+- `--bind <host>`
+- `--port <port>`
+- `--claude-binary <path>`
+- `--claude-effort-level inherit|unset|auto|low|medium|high|max`
+- `--codex-binary <path>`
+- `--log-level debug|info|warn|error`
+- `--json`
+- `--verbose`
 
 ## Model Routing
 
-Claude-facing names stay Claude-shaped. Model family and effort are mapped independently.
+Claude-facing names stay Claude-shaped. Profiles map them onto Codex models and reasoning effort:
 
-OpenAI Responses backend:
+- `claude-haiku-*` -> profile `haiku`
+- `claude-sonnet-*` -> profile `sonnet`
+- `claude-opus-*` -> profile `opus`
 
-- `claude-haiku-*` -> `gpt-5-mini` + `low`
-- `claude-sonnet-*` -> `gpt-5.4` + `medium`
-- `claude-opus-*` -> `gpt-5.4-pro` + `high`
+Default profiles:
 
-Codex OAuth backend:
+- `haiku` -> `gpt-5.4-mini` + `low`
+- `sonnet` -> `gpt-5.4` + `medium`
+- `opus` -> `gpt-5.4` + `high`
 
-- `claude-haiku-*` -> `gpt-5.4-mini` + `low`
-- `claude-sonnet-*` -> `gpt-5.4` + `medium`
-- `claude-opus-*` -> `gpt-5.4` + `high`
-
-Explicit Anthropic effort overrides only the effort:
+Anthropic effort overrides are mapped like this:
 
 - `low -> low`
 - `medium -> medium`
 - `high -> high`
 - `max -> xhigh`
-
-Aliases such as `haiku`, `sonnet`, `opus`, and `[1m]` variants are normalized before routing.
-
-## Compatibility Modes
-
-Default mode is `balanced`.
-
-- `strict`: fail fast on unsupported Anthropic features
-- `balanced`: apply safe compatibility shims and small retries for common edge cases
-- `loose`: like `balanced`, but ignores more unknown Anthropic block types
-
-In default `balanced` mode, these Anthropic-only blocks are downgraded instead of failing the whole request:
-
-- `server_tool_use`
-- `mcp_tool_use`
-- `document`
-
-Accepted today as compatibility fields rather than full first-class behavior:
-
-- `thinking`
-- `cache_control`
-
-## Current Limits
-
-This project intentionally focuses on Claude Code's main coding workflow rather than full Anthropic parity.
-
-- no automatic fallback to Anthropic
-- some Anthropic-only blocks are downgraded or rejected depending on compatibility mode
-- `server_tool_use`, `mcp_tool_use`, and `document` are still compatibility edge cases rather than native first-class features
-- the proxy is designed for local use first; packaging and distribution are secondary to runtime correctness
-
-## Sessions And Continue Behavior
-
-The proxy keeps recent conversation snapshots locally so fresh launches can recover context.
-
-- bare `-c` uses the most recent snapshot for the current working directory
-- explicit `--session-id` and `--resume` create stable same-directory isolation
-- `codex-proxy-cc sessions` shows the recent snapshots the proxy knows about
-- `--continue-session <uuid>` lets the proxy force bare `-c` toward one stored snapshot
-
-## Requirements
-
-- Node.js 20+
-- Claude Code installed and available as `claude`, or configured via `claude.binary`
-- one of:
-  - an existing `codex login` ChatGPT session
-  - an OpenAI API key in `OPENAI_API_KEY`
 
 ## Configuration
 
@@ -251,12 +158,9 @@ Example:
 
 ```json
 {
-  "backend": {
-    "type": "auto"
-  },
-  "openai": {
-    "baseUrl": "https://api.openai.com/v1",
-    "apiKeyEnv": "OPENAI_API_KEY"
+  "codex": {
+    "binary": "codex",
+    "sandbox": "workspace-write"
   },
   "server": {
     "bind": "127.0.0.1",
@@ -269,20 +173,17 @@ Example:
   "logging": {
     "level": "info"
   },
-  "compatibility": {
-    "mode": "balanced"
-  },
   "profiles": {
-    "fast": { "model": "gpt-5-mini", "codexModel": "gpt-5.4-mini", "effort": "low" },
-    "balanced": { "model": "gpt-5.4", "codexModel": "gpt-5.4", "effort": "medium" },
-    "deep": { "model": "gpt-5.4-pro", "codexModel": "gpt-5.4", "effort": "high" }
+    "haiku": { "model": "gpt-5-mini", "codexModel": "gpt-5.4-mini", "effort": "low" },
+    "sonnet": { "model": "gpt-5.4", "codexModel": "gpt-5.4", "effort": "medium" },
+    "opus": { "model": "gpt-5.4-pro", "codexModel": "gpt-5.4", "effort": "high" }
   },
   "anthropic": {
-    "defaultProfile": "balanced",
+    "defaultProfile": "sonnet",
     "modelMap": {
-      "claude-haiku-*": "fast",
-      "claude-sonnet-*": "balanced",
-      "claude-opus-*": "deep"
+      "claude-haiku-*": "haiku",
+      "claude-sonnet-*": "sonnet",
+      "claude-opus-*": "opus"
     },
     "effortMap": {
       "low": "low",
@@ -292,30 +193,27 @@ Example:
     }
   },
   "privacy": {
-    "disableNonEssentialTraffic": true,
-    "disableTelemetry": true,
-    "disableErrorReporting": true,
-    "disableFeedbackCommand": true
+    "disableNonEssentialTraffic": false,
+    "disableTelemetry": false,
+    "disableErrorReporting": false,
+    "disableFeedbackCommand": false
   }
 }
 ```
 
+Privacy toggles are opt-in. By default the launcher leaves Claude Code's native
+feature and auth surface intact so built-in commands like `/usage`,
+`/remote-control`, and plan mode keep working.
+
 Environment overrides:
 
 - `CODEX_PROXY_CC_CONFIG`
-- `CODEX_PROXY_CC_BACKEND`
-- `CODEX_PROXY_CC_OPENAI_BASE_URL`
-- `CODEX_PROXY_CC_OPENAI_API_KEY_ENV`
 - `CODEX_PROXY_CC_CODEX_BINARY`
 - `CODEX_PROXY_CC_BIND`
 - `CODEX_PROXY_CC_PORT`
 - `CODEX_PROXY_CC_CLAUDE_BINARY`
 - `CODEX_PROXY_CC_CLAUDE_EFFORT_LEVEL`
 - `CODEX_PROXY_CC_LOG_LEVEL`
-- `CODEX_PROXY_CC_COMPATIBILITY_MODE`
-- `CODEX_PROXY_CC_OPENAI_HAIKU_MODEL`
-- `CODEX_PROXY_CC_OPENAI_SONNET_MODEL`
-- `CODEX_PROXY_CC_OPENAI_OPUS_MODEL`
 - `CODEX_PROXY_CC_CODEX_HAIKU_MODEL`
 - `CODEX_PROXY_CC_CODEX_SONNET_MODEL`
 - `CODEX_PROXY_CC_CODEX_OPUS_MODEL`
@@ -323,27 +221,11 @@ Environment overrides:
 - `CODEX_PROXY_CC_SONNET_EFFORT`
 - `CODEX_PROXY_CC_OPUS_EFFORT`
 
-Example:
+## Current Limits
 
-```bash
-export CODEX_PROXY_CC_CODEX_HAIKU_MODEL=gpt-5.4-mini
-export CODEX_PROXY_CC_CODEX_SONNET_MODEL=gpt-5.4
-export CODEX_PROXY_CC_CODEX_OPUS_MODEL=gpt-5.4
-export CODEX_PROXY_CC_OPUS_EFFORT=xhigh
-```
-
-## Supported Surface
-
-- `POST /v1/messages`
-- `POST /v1/messages/count_tokens`
-- Anthropic SSE streaming
-- `tool_use` and `tool_result`
-- Claude-style model names mapped to configurable OpenAI models
-- Anthropic effort mapped to OpenAI reasoning effort
-- structured output settings inside `output_config.format`
-- `claude --print --output-format json --json-schema ...`
-- `claude -p -c` across fresh launches in the same working directory
-- `claude -p --session-id <uuid>` plus `claude -p --resume <uuid>` for same-directory isolation
+- the runtime is tuned for Claude Code `v2.1.88` behavior first
+- the proxy does not try to be a full general-purpose Anthropic replacement
+- Codex still receives a reconstructed Claude transcript for sampling; this is lightweight, but not byte-for-byte Anthropic wire parity
 
 ## Development
 
@@ -351,5 +233,3 @@ export CODEX_PROXY_CC_OPUS_EFFORT=xhigh
 cd ~/claude_plugins/codex-proxy-cc
 npm test
 ```
-
-The test suite uses only Node built-ins and local fake upstream clients.

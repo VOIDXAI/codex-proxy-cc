@@ -53,7 +53,7 @@ function summarizeFamily(config, layers, family) {
     family,
     matchedPattern: findMatchedModelPattern(config, family),
     profile: profileName,
-    openaiModel: {
+    externalModel: {
       value: profile.model,
       source: getPathSource(layers, [...profilePath, "model"]),
     },
@@ -72,13 +72,9 @@ export function inspectEffectiveConfig({ config, configPath, layers, selectedBac
   return {
     configPath,
     backend: {
-      configured: config.backend?.type,
-      configuredSource: getPathSource(layers, ["backend", "type"]),
-      selected: selectedBackend || null,
-    },
-    compatibility: {
-      mode: config.compatibility?.mode,
-      source: getPathSource(layers, ["compatibility", "mode"]),
+      configured: "codex",
+      configuredSource: "builtin",
+      selected: selectedBackend || "codex",
     },
     claude: {
       effortLevel: config.claude?.effortLevel,

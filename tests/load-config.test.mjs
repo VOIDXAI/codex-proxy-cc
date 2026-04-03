@@ -38,16 +38,16 @@ test("loadConfig supports family-based env overrides for default profiles", asyn
   await withEnv(
     {
       CODEX_PROXY_CC_CONFIG: undefined,
-      CODEX_PROXY_CC_OPENAI_HAIKU_MODEL: "gpt-5.4-mini",
+      CODEX_PROXY_CC_CODEX_HAIKU_MODEL: "gpt-5.4-mini",
       CODEX_PROXY_CC_CODEX_OPUS_MODEL: "gpt-5.3-codex",
       CODEX_PROXY_CC_SONNET_EFFORT: "max",
     },
     async () => {
       const { config } = await loadConfig({ configPath });
 
-      assert.equal(config.profiles.fast.model, "gpt-5.4-mini");
-      assert.equal(config.profiles.deep.codexModel, "gpt-5.3-codex");
-      assert.equal(config.profiles.balanced.effort, "xhigh");
+      assert.equal(config.profiles.haiku.codexModel, "gpt-5.4-mini");
+      assert.equal(config.profiles.opus.codexModel, "gpt-5.3-codex");
+      assert.equal(config.profiles.sonnet.effort, "xhigh");
     },
   );
 });
@@ -101,18 +101,69 @@ test("loadConfig applies family env overrides after custom profile remapping", a
   await withEnv(
     {
       CODEX_PROXY_CC_CONFIG: undefined,
-      CODEX_PROXY_CC_OPENAI_HAIKU_MODEL: "env-haiku-openai",
+      CODEX_PROXY_CC_CODEX_HAIKU_MODEL: "env-haiku-codex",
       CODEX_PROXY_CC_CODEX_OPUS_MODEL: "env-opus-codex",
       CODEX_PROXY_CC_OPUS_EFFORT: "max",
     },
     async () => {
       const { config } = await loadConfig({ configPath });
 
-      assert.equal(config.profiles.tiny.model, "env-haiku-openai");
+      assert.equal(config.profiles.tiny.codexModel, "env-haiku-codex");
       assert.equal(config.profiles.giant.codexModel, "env-opus-codex");
       assert.equal(config.profiles.giant.effort, "xhigh");
     },
   );
+});
+
+test("loadConfig normalizes legacy profile names in file config", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "codex-proxy-cc-config-"));
+  const configPath = path.join(dir, "config.json");
+
+  await writeFile(
+    configPath,
+    JSON.stringify(
+      {
+        profiles: {
+          fast: {
+            model: "legacy-haiku",
+            codexModel: "legacy-haiku-codex",
+            effort: "low",
+          },
+          balanced: {
+            model: "legacy-sonnet",
+            codexModel: "legacy-sonnet-codex",
+            effort: "medium",
+          },
+          deep: {
+            model: "legacy-opus",
+            codexModel: "legacy-opus-codex",
+            effort: "high",
+          },
+        },
+        anthropic: {
+          defaultProfile: "balanced",
+          modelMap: {
+            "claude-haiku-*": "fast",
+            "claude-sonnet-*": "balanced",
+            "claude-opus-*": "deep",
+          },
+        },
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+
+  const { config } = await loadConfig({ configPath });
+
+  assert.equal(config.anthropic.defaultProfile, "sonnet");
+  assert.equal(config.anthropic.modelMap["claude-haiku-*"], "haiku");
+  assert.equal(config.anthropic.modelMap["claude-sonnet-*"], "sonnet");
+  assert.equal(config.anthropic.modelMap["claude-opus-*"], "opus");
+  assert.equal(config.profiles.haiku.codexModel, "legacy-haiku-codex");
+  assert.equal(config.profiles.sonnet.codexModel, "legacy-sonnet-codex");
+  assert.equal(config.profiles.opus.codexModel, "legacy-opus-codex");
 });
 
 test("loadConfig supports Claude effort level overrides", async () => {

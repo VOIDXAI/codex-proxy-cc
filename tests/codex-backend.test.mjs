@@ -7,6 +7,72 @@ import { parseSseStream } from "../src/gateway/sse.mjs";
 import { AppError } from "../src/shared/errors.mjs";
 import { createCaptureResponse, createSseReadable } from "./helpers.mjs";
 
+function createTurnControllerHarness(scripts) {
+  const controllers = [];
+
+  return {
+    controllers,
+    async createTurnController(input) {
+      const script = scripts.shift();
+      assert.ok(script, "expected a scripted turn controller");
+
+      let eventHandler = input.onEvent;
+      const controllerState = {
+        input,
+        resumeInputs: [],
+        setOnEventCalls: 0,
+        closed: false,
+      };
+
+      function nextOutcome() {
+        const outcome = script.outcomes.shift();
+        assert.ok(outcome, "expected a scripted controller outcome");
+        outcome.events?.forEach(event => eventHandler?.(event));
+        return outcome.value;
+      }
+
+      const controller = {
+        async waitForStop() {
+          return nextOutcome();
+        },
+        async resumeWithToolResult(toolResult) {
+          controllerState.resumeInputs.push(toolResult);
+          return nextOutcome();
+        },
+        setOnEvent(nextHandler) {
+          controllerState.setOnEventCalls += 1;
+          eventHandler = nextHandler;
+        },
+        getMetadata() {
+          return {
+            threadId: script.threadId || "thread_tool",
+            threadPath: script.threadPath || "/tmp/thread-tool.json",
+            model: script.model || input.model,
+          };
+        },
+        async close() {
+          controllerState.closed = true;
+        },
+      };
+
+      controllerState.controller = controller;
+      controllers.push(controllerState);
+      return controller;
+    },
+  };
+}
+
+async function collectSseEvents(body) {
+  const events = [];
+  for await (const event of parseSseStream(createSseReadable([body]))) {
+    events.push({
+      event: event.event,
+      data: JSON.parse(event.data),
+    });
+  }
+  return events;
+}
+
 test("codex backend preserves tool_use and tool_result history in its prompt transcript", async () => {
   const calls = [];
   const backend = createCodexBackend({
@@ -61,45 +127,264 @@ test("codex backend preserves tool_use and tool_result history in its prompt tra
   assert.match(calls[0].prompt, /Frontend tool result for tool_123/);
 });
 
-test("codex backend rejects unsupported Anthropic content blocks in strict mode", async () => {
-  const strictConfig = {
-    ...DEFAULT_CONFIG,
-    compatibility: {
-      mode: "strict",
+test("codex backend bridges native Anthropic tools through Codex dynamic tool calls", async () => {
+  const harness = createTurnControllerHarness([
+    {
+      model: "gpt-5.4",
+      outcomes: [
+        {
+          value: {
+            type: "tool_request",
+            toolCall: {
+              id: "call_readme_1",
+              name: "read_file",
+              input: { path: "README.md" },
+            },
+            usage: {
+              input_tokens: 14,
+              output_tokens: 2,
+            },
+          },
+        },
+        {
+          value: {
+            type: "completed",
+            turn: {
+              status: "completed",
+            },
+            result: {
+              threadId: "thread_tool",
+              threadPath: "/tmp/thread-tool.json",
+              model: "gpt-5.4",
+              finalMessage: "README inspected.",
+              usage: {
+                input_tokens: 18,
+                output_tokens: 5,
+              },
+            },
+          },
+        },
+      ],
+    },
+  ]);
+  const backend = createCodexBackend({
+    config: DEFAULT_CONFIG,
+    logger: null,
+    createTurnController: harness.createTurnController,
+  });
+  const nativeTool = {
+    name: "read_file",
+    description: "Read a file from the workspace",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+      },
+      required: ["path"],
+      additionalProperties: false,
     },
   };
-  const backend = createCodexBackend({
-    config: strictConfig,
-    logger: null,
-    async runTurn() {
-      throw new Error("should not be called");
+
+  const firstResponse = await backend.createMessage({
+    model: "sonnet",
+    _codexProxyCc: {
+      sessionId: "native-tool-session-1",
     },
+    messages: [{ role: "user", content: "Read the README and summarize it." }],
+    tools: [nativeTool],
   });
 
-  await assert.rejects(
-    () =>
-      backend.createMessage({
-        model: "sonnet",
-        messages: [
+  assert.equal(firstResponse.stop_reason, "tool_use");
+  assert.equal(firstResponse.content[0].id, "call_readme_1");
+  assert.equal(firstResponse.content[0].name, "read_file");
+  assert.match(harness.controllers[0].input.prompt, /Use the provided frontend tools whenever/);
+  assert.equal(harness.controllers[0].input.dynamicTools[0].name, "read_file");
+
+  const secondResponse = await backend.createMessage({
+    model: "sonnet",
+    _codexProxyCc: {
+      sessionId: "native-tool-session-1",
+    },
+    messages: [
+      { role: "user", content: "Read the README and summarize it." },
+      {
+        role: "assistant",
+        content: [
           {
-            role: "user",
-            content: [
-              {
-                type: "document",
-                source: {
-                  type: "text",
-                  data: "hello",
-                },
-              },
-            ],
+            type: "tool_use",
+            id: "call_readme_1",
+            name: "read_file",
+            input: { path: "README.md" },
           },
         ],
-      }),
-    /Unsupported Anthropic content block 'document'/,
-  );
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "call_readme_1",
+            content: [{ type: "text", text: "README body" }],
+          },
+        ],
+      },
+    ],
+    tools: [nativeTool],
+  });
+
+  assert.equal(secondResponse.stop_reason, "end_turn");
+  assert.equal(secondResponse.content[0].text, "README inspected.");
+  assert.deepEqual(harness.controllers[0].resumeInputs, [
+    {
+      contentItems: [{ type: "inputText", text: "README body" }],
+      success: true,
+    },
+  ]);
+  assert.equal(harness.controllers[0].closed, true);
 });
 
-test("codex backend downgrades document blocks in balanced mode", async () => {
+test("codex backend rebinds streamed native tool resumes onto the current response", async () => {
+  const harness = createTurnControllerHarness([
+    {
+      model: "gpt-5.4",
+      outcomes: [
+        {
+          value: {
+            type: "tool_request",
+            toolCall: {
+              id: "call_readme_2",
+              name: "read_file",
+              input: { path: "README.md" },
+            },
+            usage: {
+              input_tokens: 11,
+              output_tokens: 1,
+            },
+          },
+        },
+        {
+          events: [
+            {
+              type: "agent_message_delta",
+              itemId: "agent_1",
+              delta: "delta-answer",
+            },
+            {
+              type: "item_completed",
+              item: {
+                type: "agentMessage",
+                id: "agent_1",
+                phase: "final_answer",
+                text: "delta-answer",
+              },
+            },
+          ],
+          value: {
+            type: "completed",
+            turn: {
+              status: "completed",
+            },
+            result: {
+              threadId: "thread_tool",
+              threadPath: "/tmp/thread-tool.json",
+              model: "gpt-5.4",
+              finalMessage: "final-answer",
+              usage: {
+                input_tokens: 17,
+                output_tokens: 4,
+              },
+              reasoningSummaries: [],
+            },
+          },
+        },
+      ],
+    },
+  ]);
+  const backend = createCodexBackend({
+    config: DEFAULT_CONFIG,
+    logger: null,
+    createTurnController: harness.createTurnController,
+  });
+  const nativeTool = {
+    name: "read_file",
+    description: "Read a file from the workspace",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  };
+
+  const firstRes = createCaptureResponse();
+  await backend.streamMessage(
+    {
+      model: "sonnet",
+      stream: true,
+      _codexProxyCc: {
+        sessionId: "native-tool-session-2",
+      },
+      messages: [{ role: "user", content: "Read the README and summarize it." }],
+      tools: [nativeTool],
+    },
+    firstRes,
+  );
+
+  const firstEvents = await collectSseEvents(firstRes.body);
+  assert.equal(firstEvents[1].data.content_block.type, "tool_use");
+  assert.equal(firstEvents[1].data.content_block.id, "call_readme_2");
+  assert.equal(firstEvents[4].data.delta.stop_reason, "tool_use");
+
+  const secondRes = createCaptureResponse();
+  await backend.streamMessage(
+    {
+      model: "sonnet",
+      stream: true,
+      _codexProxyCc: {
+        sessionId: "native-tool-session-2",
+      },
+      messages: [
+        { role: "user", content: "Read the README and summarize it." },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "call_readme_2",
+              name: "read_file",
+              input: { path: "README.md" },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_readme_2",
+              content: [{ type: "text", text: "README body" }],
+            },
+          ],
+        },
+      ],
+      tools: [nativeTool],
+    },
+    secondRes,
+  );
+
+  const secondEvents = await collectSseEvents(secondRes.body);
+  const secondTextDeltas = secondEvents
+    .filter(event => event.event === "content_block_delta" && event.data.delta.type === "text_delta")
+    .map(event => event.data.delta.text);
+
+  assert.deepEqual(secondTextDeltas, ["delta-answer"]);
+  assert.equal(harness.controllers[0].setOnEventCalls, 1);
+  assert.equal(harness.controllers[0].closed, true);
+});
+
+test("codex backend serializes native Claude-only input blocks into the prompt transcript", async () => {
   const calls = [];
   const backend = createCodexBackend({
     config: DEFAULT_CONFIG,
@@ -129,23 +414,93 @@ test("codex backend downgrades document blocks in balanced mode", async () => {
               data: "Document body text",
             },
           },
+          {
+            type: "tool_reference",
+            tool_name: "RemoteTriggerTool",
+          },
+        ],
+      },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "server_tool_use",
+            id: "srv_1",
+            name: "web_search",
+            input: { query: "codex proxy" },
+          },
         ],
       },
     ],
   });
 
   assert.equal(response.content[0].text, "document-ok");
+  assert.match(calls[0].prompt, /Attached document:/);
   assert.match(calls[0].prompt, /Document body text/);
+  assert.match(calls[0].prompt, /Deferred Claude tool reference discovered/);
+  assert.match(calls[0].prompt, /Anthropic server tool call: web_search/);
 });
 
-test("codex backend retries with fallback model when the configured Codex model is unsupported", async () => {
+test("codex backend ignores unknown Anthropic content blocks and logs a warning", async () => {
+  const warnings = [];
+  const calls = [];
+  const backend = createCodexBackend({
+    config: DEFAULT_CONFIG,
+    logger: {
+      warn(message, details) {
+        warnings.push({ message, details });
+      },
+    },
+    async runTurn(input) {
+      calls.push(input);
+      return {
+        finalMessage: "ignored-unknown-block",
+        usage: {
+          input_tokens: 10,
+          output_tokens: 2,
+        },
+      };
+    },
+  });
+
+  const response = await backend.createMessage({
+    model: "sonnet",
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: "Keep this text.",
+          },
+          {
+            type: "audio",
+            source: {
+              type: "url",
+              url: "https://example.com/audio.mp3",
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.equal(response.content[0].text, "ignored-unknown-block");
+  assert.match(calls[0].prompt, /Keep this text\./);
+  assert.doesNotMatch(calls[0].prompt, /audio\.mp3/);
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].message, "Ignoring unsupported Anthropic content block");
+  assert.equal(warnings[0].details.blockType, "audio");
+});
+
+test("codex backend surfaces unsupported Codex models instead of retrying with a fallback", async () => {
   const calls = [];
   const config = {
     ...DEFAULT_CONFIG,
     profiles: {
       ...DEFAULT_CONFIG.profiles,
-      deep: {
-        ...DEFAULT_CONFIG.profiles.deep,
+      opus: {
+        ...DEFAULT_CONFIG.profiles.opus,
         codexModel: "unsupported-codex-model",
       },
     },
@@ -171,13 +526,15 @@ test("codex backend retries with fallback model when the configured Codex model 
     },
   });
 
-  const response = await backend.createMessage({
-    model: "opus",
-    messages: [{ role: "user", content: "hello" }],
-  });
-
-  assert.equal(response.content[0].text, "fallback-ok");
-  assert.deepEqual(calls, ["unsupported-codex-model", "gpt-5.4"]);
+  await assert.rejects(
+    () =>
+      backend.createMessage({
+        model: "opus",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    /not supported/i,
+  );
+  assert.deepEqual(calls, ["unsupported-codex-model"]);
 });
 
 test("codex backend normalizes structured JSON output before returning it", async () => {
@@ -304,6 +661,35 @@ test("codex backend prompt tells the agent to use StructuredOutput when JSON is 
   assert.match(calls[0].prompt, /You must use the StructuredOutput tool for the final response\./);
   assert.match(calls[0].prompt, /Your entire response must be a single valid JSON object\./);
   assert.match(calls[0].prompt, /Do not include markdown fences, explanations, prefixes, or suffixes\./);
+});
+
+test("codex backend prompt preserves explicit Claude tool_choice requirements", async () => {
+  const calls = [];
+  const backend = createCodexBackend({
+    config: DEFAULT_CONFIG,
+    logger: null,
+    async runTurn(input) {
+      calls.push(input);
+      return {
+        finalMessage: "tool-choice-ok",
+        usage: {
+          input_tokens: 12,
+          output_tokens: 3,
+        },
+      };
+    },
+  });
+
+  await backend.createMessage({
+    model: "sonnet",
+    messages: [{ role: "user", content: "Read the README." }],
+    tool_choice: {
+      type: "tool",
+      name: "read_file",
+    },
+  });
+
+  assert.match(calls[0].prompt, /You must call the frontend tool 'read_file' before your final response\./);
 });
 
 test("codex backend omits stop-hook structured-output retries from the replayed transcript", async () => {
@@ -559,6 +945,9 @@ test("codex backend saves recent conversation snapshots for streamed replies", a
     config: DEFAULT_CONFIG,
     logger: null,
     sessionStore: {
+      async loadRecentConversation() {
+        return null;
+      },
       async saveRecentConversation(entry) {
         saved.push(entry);
       },
@@ -602,4 +991,173 @@ test("codex backend saves recent conversation snapshots for streamed replies", a
       ],
     },
   ]);
+});
+
+test("codex backend reuses stored codex threads and only prompts with incremental transcript", async () => {
+  const calls = [];
+  const backend = createCodexBackend({
+    config: DEFAULT_CONFIG,
+    logger: null,
+    sessionStore: {
+      async loadRecentConversation() {
+        return {
+          messages: [
+            { role: "user", content: "Remember alpha." },
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "I will remember alpha." }],
+            },
+          ],
+          metadata: {
+            backend: "codex-app-server",
+            threadId: "thread_prev",
+            threadPath: "/tmp/thread-prev.json",
+            model: "gpt-5.4",
+          },
+        };
+      },
+      async saveRecentConversation() {},
+    },
+    async runTurn(input) {
+      calls.push(input);
+      return {
+        threadId: "thread_prev",
+        threadPath: "/tmp/thread-prev.json",
+        model: input.model,
+        finalMessage: "alpha remembered",
+        usage: {
+          input_tokens: 12,
+          output_tokens: 3,
+        },
+      };
+    },
+  });
+
+  const response = await backend.createMessage({
+    model: "sonnet",
+    _codexProxyCc: {
+      cwd: process.cwd(),
+      conversationKey: "44444444-4444-4444-8444-444444444444",
+    },
+    messages: [
+      { role: "user", content: "Remember alpha." },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "I will remember alpha." }],
+      },
+      { role: "user", content: "What should you remember?" },
+    ],
+  });
+
+  assert.equal(response.content[0].text, "alpha remembered");
+  assert.equal(calls[0].threadContext.threadId, "thread_prev");
+  assert.equal(calls[0].threadContext.threadPath, "/tmp/thread-prev.json");
+  assert.match(calls[0].prompt, /What should you remember\?/);
+  assert.doesNotMatch(calls[0].prompt, /Remember alpha\./);
+});
+
+test("codex backend streams plan and reasoning summaries when thinking is requested", async () => {
+  const backend = createCodexBackend({
+    config: DEFAULT_CONFIG,
+    logger: null,
+    async runTurn(input) {
+      input.onEvent?.({
+        type: "reasoning_summary_delta",
+        itemId: "reason_1",
+        summaryIndex: 0,
+        delta: "Map the work.",
+      });
+      input.onEvent?.({
+        type: "item_completed",
+        item: {
+          type: "reasoning",
+          id: "reason_1",
+          summary: ["Map the work."],
+        },
+      });
+      input.onEvent?.({
+        type: "plan_delta",
+        itemId: "plan_1",
+        delta: "1. Inspect project",
+      });
+      input.onEvent?.({
+        type: "item_completed",
+        item: {
+          type: "plan",
+          id: "plan_1",
+          text: "1. Inspect project",
+        },
+      });
+      input.onEvent?.({
+        type: "agent_message_delta",
+        itemId: "agent_1",
+        delta: "Implemented.",
+      });
+      input.onEvent?.({
+        type: "item_completed",
+        item: {
+          type: "agentMessage",
+          id: "agent_1",
+          phase: "final_answer",
+          text: "Implemented.",
+        },
+      });
+      return {
+        threadId: "thread_live",
+        threadPath: "/tmp/thread-live.json",
+        model: input.model,
+        finalMessage: "Implemented.",
+        reasoningSummaries: ["Map the work."],
+        usage: {
+          input_tokens: 8,
+          output_tokens: 3,
+        },
+      };
+    },
+  });
+
+  const res = createCaptureResponse();
+  await backend.streamMessage(
+    {
+      model: "sonnet",
+      stream: true,
+      thinking: {
+        type: "enabled",
+        budget_tokens: 1024,
+      },
+      messages: [{ role: "user", content: "Plan this change." }],
+    },
+    res,
+  );
+
+  const events = [];
+  for await (const event of parseSseStream(createSseReadable([res.body]))) {
+    events.push({
+      event: event.event,
+      data: JSON.parse(event.data),
+    });
+  }
+
+  const thinkingStart = events.find(
+    event => event.event === "content_block_start" && event.data.content_block.type === "thinking",
+  );
+  const thinkingDelta = events.find(
+    event => event.event === "content_block_delta" && event.data.delta.type === "thinking_delta",
+  );
+  const textStarts = events.filter(
+    event => event.event === "content_block_start" && event.data.content_block.type === "text",
+  );
+  const textDeltas = events.filter(
+    event => event.event === "content_block_delta" && event.data.delta.type === "text_delta",
+  );
+  const messageDelta = events.find(event => event.event === "message_delta");
+
+  assert.ok(thinkingStart);
+  assert.equal(thinkingDelta.data.delta.thinking, "Map the work.");
+  assert.equal(textStarts.length, 2);
+  assert.deepEqual(
+    textDeltas.map(event => event.data.delta.text),
+    ["1. Inspect project", "Implemented."],
+  );
+  assert.equal(messageDelta.data.usage.input_tokens, 8);
 });

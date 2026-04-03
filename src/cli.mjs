@@ -7,12 +7,9 @@ import {
   buildClaudeEnv,
   findClaudeBinary,
   generateLocalGatewayToken,
-  parseClaudeLaunchHints,
 } from "./launcher/env.mjs";
 import { launchClaude } from "./launcher/run.mjs";
-import { AppError } from "./shared/errors.mjs";
 import { createLogger, defaultRuntimeLogFilePath } from "./shared/logging.mjs";
-import { createFileSessionStore } from "./shared/session-store.mjs";
 
 function parseOptions(argv) {
   const args = [...argv];
@@ -21,11 +18,9 @@ function parseOptions(argv) {
   let configPath;
   let verbose = false;
   const overrides = {};
-  let continueSession;
-  let cwd;
-  let limit;
+  let json = false;
 
-  if (args[0] && ["run", "gateway", "doctor", "config", "sessions", "help"].includes(args[0])) {
+  if (args[0] && ["run", "gateway", "doctor", "config", "help"].includes(args[0])) {
     command = args.shift();
     if (command === "config" && args[0] === "dump") {
       args.shift();
@@ -59,37 +54,15 @@ function parseOptions(argv) {
         overrides.claude ??= {};
         overrides.claude.effortLevel = args.shift();
         break;
-      case "--continue-session":
-        continueSession = args.shift();
-        break;
-      case "--openai-base-url":
-        overrides.openai ??= {};
-        overrides.openai.baseUrl = args.shift();
-        break;
-      case "--api-key-env":
-        overrides.openai ??= {};
-        overrides.openai.apiKeyEnv = args.shift();
-        break;
       case "--log-level":
         overrides.logging ??= {};
         overrides.logging.level = args.shift();
         break;
-      case "--compatibility-mode":
-        overrides.compatibility ??= {};
-        overrides.compatibility.mode = args.shift();
-        break;
-      case "--cwd":
-        cwd = args.shift();
-        break;
-      case "--limit":
-        limit = Number.parseInt(args.shift(), 10);
-        break;
       case "--verbose":
         verbose = true;
         break;
-      case "--backend":
-        overrides.backend ??= {};
-        overrides.backend.type = args.shift();
+      case "--json":
+        json = true;
         break;
       case "--codex-binary":
         overrides.codex ??= {};
@@ -111,9 +84,7 @@ function parseOptions(argv) {
     overrides,
     passthrough,
     verbose,
-    continueSession,
-    cwd,
-    limit,
+    json,
   };
 }
 
@@ -125,7 +96,6 @@ Usage:
   codex-proxy-cc gateway
   codex-proxy-cc doctor
   codex-proxy-cc config [dump]
-  codex-proxy-cc sessions
 
 Options:
   --config <path>          Path to JSON config file
@@ -133,15 +103,9 @@ Options:
   --port <port>            Gateway port (0 for random)
   --claude-binary <path>   Claude Code binary or command name
   --claude-effort-level    inherit | unset | auto | low | medium | high | max
-  --continue-session <id>  Proxy-side target session for same-directory -c resumes
   --codex-binary <path>    Codex binary or command name
-  --openai-base-url <url>  OpenAI-compatible base URL
-  --api-key-env <name>     Environment variable containing the OpenAI API key
-  --backend <type>         auto | codex | openai
   --log-level <level>      debug | info | warn | error
-  --compatibility-mode     strict | balanced | loose
-  --cwd <path>             Working directory filter for sessions
-  --limit <n>              Max sessions to print for the sessions command
+  --json                   Print machine-readable JSON for supported commands
   --verbose                Print extra config and routing details
 `.trim();
 
@@ -173,7 +137,16 @@ function safelySelectBackend(config) {
   }
 }
 
-async function runConfigCommand({ config, configPath, layers, verbose }) {
+function printJsonPayload(payload) {
+  // eslint-disable-next-line no-console
+  console.log(JSON.stringify(payload, null, 2));
+}
+
+function formatSourceValue(value, source) {
+  return `${value ?? "unset"} (${source || "unknown"})`;
+}
+
+function buildConfigPayload({ config, configPath, layers, verbose }) {
   const selectedBackend = safelySelectBackend(config);
   const inspection = inspectEffectiveConfig({
     config,
@@ -187,139 +160,192 @@ async function runConfigCommand({ config, configPath, layers, verbose }) {
     ...(verbose ? { config } : {}),
   };
 
-  // eslint-disable-next-line no-console
-  console.log(JSON.stringify(payload, null, 2));
+  return payload;
 }
 
-async function runDoctorCommand({ config, configPath, layers, logger, verbose }) {
-  const binary = findClaudeBinary(config.claude.binary);
-  const selectedBackend = selectBackendType(config);
-  const codexStatus = getCodexBackendStatus(config);
-  const gateway = await startGatewayServer({
+function printConfigSummary(payload) {
+  const lines = [
+    "Config Summary",
+    `Path: ${payload.configPath || "defaults/env only"}`,
+    `Runtime backend: ${payload.backend.selected || "codex"}`,
+    `Claude effort passthrough: ${formatSourceValue(payload.claude.effortLevel, payload.claude.effortLevelSource)}`,
+    "Model families:",
+  ];
+
+  for (const family of payload.families || []) {
+    lines.push(
+      [
+        `- ${family.family}`,
+        `profile=${family.profile}`,
+        `pattern=${family.matchedPattern || "n/a"}`,
+        `external=${formatSourceValue(family.externalModel?.value, family.externalModel?.source)}`,
+        `codex=${formatSourceValue(family.codexModel?.value, family.codexModel?.source)}`,
+        `effort=${formatSourceValue(family.defaultEffort?.value, family.defaultEffort?.source)}`,
+      ].join("  "),
+    );
+  }
+
+  // eslint-disable-next-line no-console
+  console.log(lines.join("\n"));
+}
+
+function buildDoctorIssues({
+  claudeBinaryStatus,
+  codexStatus,
+  gatewayStatus,
+}) {
+  const issues = [];
+
+  if (!claudeBinaryStatus.ok) {
+    issues.push(`Claude binary is unavailable: ${claudeBinaryStatus.error}`);
+  }
+  if (!codexStatus.loggedIn) {
+    issues.push("Codex login is not active.");
+  }
+  if (gatewayStatus && !gatewayStatus.ok) {
+    issues.push(`Gateway health check failed: ${gatewayStatus.error || "unknown error"}`);
+  }
+
+  return issues;
+}
+
+function printDoctorSummary(payload) {
+  const lines = [
+    "Doctor",
+    `Status: ${payload.ok ? "ok" : "needs attention"}`,
+    `Claude binary: ${payload.claudeBinary.ok ? payload.claudeBinary.path : `missing (${payload.claudeBinary.error})`}`,
+    `Runtime backend: ${payload.backend || "codex"}`,
+    `Codex auth: ${payload.codexAuth.loggedIn ? "logged in" : "not logged in"}`,
+    `Gateway: ${
+      payload.gateway?.ok
+        ? `${payload.gateway.url} (${payload.gateway.provider || "unknown"})`
+        : payload.gateway?.url || payload.gateway?.error || "not started"
+    }`,
+  ];
+
+  if (payload.issues.length > 0) {
+    lines.push("Remediation:");
+    for (const issue of payload.issues) {
+      lines.push(`- ${issue}`);
+    }
+  }
+
+  // eslint-disable-next-line no-console
+  console.log(lines.join("\n"));
+}
+
+async function runConfigCommand({ config, configPath, layers, verbose, json }) {
+  const payload = buildConfigPayload({
     config,
-    logger,
-    localToken: generateLocalGatewayToken(),
+    configPath,
+    layers,
+    verbose,
   });
 
-  try {
-    const response = await fetch(`${gateway.url}/healthz`);
-    const payload = await response.json();
-    const inspection = inspectEffectiveConfig({
-      config,
-      configPath,
-      layers,
-      selectedBackend,
-    });
-    // eslint-disable-next-line no-console
-    console.log(
-      JSON.stringify(
-        {
-          ok: response.ok,
-          claudeBinary: binary,
-          backend: selectedBackend,
-          codexAuth: codexStatus,
-          openaiApiKeyEnv: config.openai.apiKeyEnv,
-          gateway: gateway.url,
-          health: payload,
-          ...(verbose ? { inspection, config } : {}),
-        },
-        null,
-        2,
-      ),
-    );
-  } finally {
-    await gateway.close();
+  if (json) {
+    printJsonPayload(payload);
+    return;
   }
+
+  printConfigSummary(payload);
 }
 
-function mergeLaunchHints(parsedHints, options) {
-  const merged = {
-    ...parsedHints,
+async function runDoctorCommand({ config, configPath, layers, logger, verbose, json }) {
+  let claudeBinaryStatus;
+  try {
+    claudeBinaryStatus = {
+      ok: true,
+      path: findClaudeBinary(config.claude.binary),
+    };
+  } catch (error) {
+    claudeBinaryStatus = {
+      ok: false,
+      path: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  let codexStatus;
+  try {
+    codexStatus = getCodexBackendStatus(config);
+  } catch (error) {
+    codexStatus = {
+      available: false,
+      loggedIn: false,
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  const selectedBackend = safelySelectBackend(config);
+  const inspection = inspectEffectiveConfig({
+    config,
+    configPath,
+    layers,
+    selectedBackend,
+  });
+
+  let gatewayStatus = {
+    ok: false,
+    url: null,
+    provider: null,
+    error: selectedBackend ? null : "backend unavailable",
+    health: null,
+  };
+  let gateway = null;
+
+  if (selectedBackend) {
+    try {
+      gateway = await startGatewayServer({
+        config,
+        logger,
+        localToken: generateLocalGatewayToken(),
+      });
+      const response = await fetch(`${gateway.url}/healthz`);
+      const health = await response.json();
+      gatewayStatus = {
+        ok: response.ok,
+        url: gateway.url,
+        provider: health?.provider || null,
+        error: response.ok ? null : `healthz returned ${response.status}`,
+        health,
+      };
+    } catch (error) {
+      gatewayStatus = {
+        ok: false,
+        url: gateway?.url || null,
+        provider: null,
+        error: error instanceof Error ? error.message : String(error),
+        health: null,
+      };
+    } finally {
+      await gateway?.close?.();
+    }
+  }
+
+  const payload = {
+    ok:
+      claudeBinaryStatus.ok &&
+      codexStatus.loggedIn &&
+      gatewayStatus.ok,
+    claudeBinary: claudeBinaryStatus,
+    backend: selectedBackend || "codex",
+    codexAuth: codexStatus,
+    gateway: gatewayStatus,
+    issues: buildDoctorIssues({
+      claudeBinaryStatus,
+      codexStatus,
+      gatewayStatus,
+    }),
+    ...(verbose ? { inspection, config } : {}),
   };
 
-  if (typeof options.continueSession === "string" && options.continueSession.trim()) {
-    merged.continue = true;
-    merged.resumeKey = options.continueSession.trim();
+  if (json) {
+    printJsonPayload(payload);
+    return;
   }
 
-  return merged;
+  printDoctorSummary(payload);
 }
-
-function stripSystemReminderBlocks(text) {
-  if (typeof text !== "string" || !text.trim()) {
-    return "";
-  }
-
-  return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/gi, " ").trim();
-}
-
-function compactSummaryText(text) {
-  if (typeof text !== "string") {
-    return undefined;
-  }
-
-  const normalized = text.replace(/\s+/g, " ").trim();
-  return normalized ? normalized.slice(0, 160) : undefined;
-}
-
-function summarizeTextMessage(message) {
-  if (!message || typeof message !== "object") {
-    return undefined;
-  }
-
-  if (typeof message.content === "string" && message.content.trim()) {
-    return compactSummaryText(stripSystemReminderBlocks(message.content));
-  }
-
-  if (!Array.isArray(message.content)) {
-    return undefined;
-  }
-
-  for (let index = message.content.length - 1; index >= 0; index -= 1) {
-    const block = message.content[index];
-    if (block?.type !== "text" || typeof block.text !== "string") {
-      continue;
-    }
-
-    const summary = compactSummaryText(stripSystemReminderBlocks(block.text));
-    if (summary) {
-      return summary;
-    }
-  }
-
-  return undefined;
-}
-
-async function runSessionsCommand({ cwd, limit }) {
-  const sessionStore = createFileSessionStore();
-  const conversations = await sessionStore.listRecentConversations({
-    cwd: cwd || process.cwd(),
-    limit: Number.isInteger(limit) && limit > 0 ? limit : undefined,
-  });
-
-  // eslint-disable-next-line no-console
-  console.log(
-    JSON.stringify(
-      {
-        cwd: cwd || process.cwd(),
-        count: conversations.length,
-        sessions: conversations.map(entry => ({
-          cwd: entry.cwd,
-          conversationKey: entry.conversationKey || null,
-          updatedAt: entry.updatedAt,
-          messageCount: Array.isArray(entry.messages) ? entry.messages.length : 0,
-          lastUserText: [...(entry.messages || [])]
-            .reverse()
-            .map(message => (message?.role === "user" ? summarizeTextMessage(message) : undefined))
-            .find(Boolean),
-        })),
-      },
-      null,
-      2,
-    ),
-  );
-}
-
 function isNonInteractivePrintRun(claudeArgs = []) {
   return claudeArgs.some(arg => arg === "-p" || arg === "--print");
 }
@@ -340,7 +366,7 @@ function createRuntimeLogger(config, claudeArgs, logger) {
   });
 }
 
-async function runDefaultCommand(config, logger, claudeArgs, options = {}) {
+async function runDefaultCommand(config, logger, claudeArgs) {
   const runtimeLogger = createRuntimeLogger(config, claudeArgs, logger);
   const localToken = generateLocalGatewayToken();
   const gateway = await startGatewayServer({
@@ -353,7 +379,6 @@ async function runDefaultCommand(config, logger, claudeArgs, options = {}) {
     gatewayUrl: gateway.url,
     localToken,
     config,
-    launchHints: mergeLaunchHints(parseClaudeLaunchHints(claudeArgs), options),
   });
 
   const code = await launchClaude({
@@ -392,6 +417,7 @@ export async function main(argv = process.argv.slice(2)) {
       layers,
       logger,
       verbose: parsed.verbose,
+      json: parsed.json,
     });
     return;
   }
@@ -402,19 +428,10 @@ export async function main(argv = process.argv.slice(2)) {
       configPath,
       layers,
       verbose: parsed.verbose,
+      json: parsed.json,
     });
     return;
   }
 
-  if (parsed.command === "sessions") {
-    await runSessionsCommand({
-      cwd: parsed.cwd,
-      limit: parsed.limit,
-    });
-    return;
-  }
-
-  await runDefaultCommand(config, logger, parsed.passthrough, {
-    continueSession: parsed.continueSession,
-  });
+  await runDefaultCommand(config, logger, parsed.passthrough);
 }

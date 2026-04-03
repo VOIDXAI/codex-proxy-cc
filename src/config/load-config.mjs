@@ -4,8 +4,13 @@ import path from "node:path";
 
 import { matchAnthropicProfile } from "../adapters/model-mapping.mjs";
 import { AppError } from "../shared/errors.mjs";
-import { normalizeCompatibilityMode } from "../shared/compatibility.mjs";
 import { DEFAULT_CONFIG } from "./defaults.mjs";
+
+const LEGACY_PROFILE_NAMES = {
+  fast: "haiku",
+  balanced: "sonnet",
+  deep: "opus",
+};
 
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -36,6 +41,66 @@ function parseInteger(value, fallback) {
 
 function defaultConfigPath() {
   return path.join(os.homedir(), ".config", "codex-proxy-cc", "config.json");
+}
+
+function normalizeLegacyProfileName(name) {
+  return LEGACY_PROFILE_NAMES[String(name)] || name;
+}
+
+function normalizeLegacyProfiles(profiles) {
+  if (!isPlainObject(profiles)) {
+    return profiles;
+  }
+
+  const normalized = {};
+  for (const [name, profile] of Object.entries(profiles)) {
+    const nextName = normalizeLegacyProfileName(name);
+    if (!(nextName in normalized)) {
+      normalized[nextName] = profile;
+      continue;
+    }
+
+    if (nextName === name) {
+      normalized[nextName] = deepMerge(normalized[nextName], profile);
+    }
+  }
+
+  return normalized;
+}
+
+function normalizeLegacyAnthropicConfig(anthropic) {
+  if (!isPlainObject(anthropic)) {
+    return anthropic;
+  }
+
+  const modelMap = isPlainObject(anthropic.modelMap)
+    ? Object.fromEntries(
+        Object.entries(anthropic.modelMap).map(([pattern, profileName]) => [
+          pattern,
+          normalizeLegacyProfileName(profileName),
+        ]),
+      )
+    : anthropic.modelMap;
+
+  return {
+    ...anthropic,
+    ...(anthropic.defaultProfile
+      ? { defaultProfile: normalizeLegacyProfileName(anthropic.defaultProfile) }
+      : {}),
+    ...(modelMap ? { modelMap } : {}),
+  };
+}
+
+function normalizeLegacyConfig(config) {
+  if (!isPlainObject(config)) {
+    return config;
+  }
+
+  return {
+    ...config,
+    ...(config.profiles ? { profiles: normalizeLegacyProfiles(config.profiles) } : {}),
+    ...(config.anthropic ? { anthropic: normalizeLegacyAnthropicConfig(config.anthropic) } : {}),
+  };
 }
 
 function normalizeProfileEffortOverride(value) {
@@ -124,19 +189,16 @@ function familyEnvOverrides(baseConfig) {
   const families = [
     {
       family: "haiku",
-      openaiModelEnv: "CODEX_PROXY_CC_OPENAI_HAIKU_MODEL",
       codexModelEnv: "CODEX_PROXY_CC_CODEX_HAIKU_MODEL",
       effortEnv: "CODEX_PROXY_CC_HAIKU_EFFORT",
     },
     {
       family: "sonnet",
-      openaiModelEnv: "CODEX_PROXY_CC_OPENAI_SONNET_MODEL",
       codexModelEnv: "CODEX_PROXY_CC_CODEX_SONNET_MODEL",
       effortEnv: "CODEX_PROXY_CC_SONNET_EFFORT",
     },
     {
       family: "opus",
-      openaiModelEnv: "CODEX_PROXY_CC_OPENAI_OPUS_MODEL",
       codexModelEnv: "CODEX_PROXY_CC_CODEX_OPUS_MODEL",
       effortEnv: "CODEX_PROXY_CC_OPUS_EFFORT",
     },
@@ -145,9 +207,6 @@ function familyEnvOverrides(baseConfig) {
   for (const item of families) {
     const nextValues = {};
 
-    if (process.env[item.openaiModelEnv]?.trim()) {
-      nextValues.model = process.env[item.openaiModelEnv].trim();
-    }
     if (process.env[item.codexModelEnv]?.trim()) {
       nextValues.codexModel = process.env[item.codexModelEnv].trim();
     }
@@ -167,13 +226,6 @@ function familyEnvOverrides(baseConfig) {
 
 function envOverrides(baseConfig) {
   return {
-    backend: {
-      type: process.env.CODEX_PROXY_CC_BACKEND,
-    },
-    openai: {
-      baseUrl: process.env.CODEX_PROXY_CC_OPENAI_BASE_URL || process.env.OPENAI_BASE_URL,
-      apiKeyEnv: process.env.CODEX_PROXY_CC_OPENAI_API_KEY_ENV,
-    },
     codex: {
       binary: process.env.CODEX_PROXY_CC_CODEX_BINARY,
     },
@@ -188,23 +240,11 @@ function envOverrides(baseConfig) {
     logging: {
       level: process.env.CODEX_PROXY_CC_LOG_LEVEL,
     },
-    compatibility: {
-      mode: process.env.CODEX_PROXY_CC_COMPATIBILITY_MODE,
-    },
     ...familyEnvOverrides(baseConfig),
   };
 }
 
 function validateConfig(config) {
-  if (!["auto", "openai", "codex"].includes(config.backend?.type)) {
-    throw new AppError("backend.type must be one of: auto, openai, codex");
-  }
-  if (!config.openai?.baseUrl) {
-    throw new AppError("openai.baseUrl is required");
-  }
-  if (!config.openai?.apiKeyEnv) {
-    throw new AppError("openai.apiKeyEnv is required");
-  }
   if (!config.codex?.binary) {
     throw new AppError("codex.binary is required");
   }
@@ -221,9 +261,6 @@ function validateConfig(config) {
     ...config.claude,
     effortLevel: normalizeClaudeEffortLevelOverride(config.claude?.effortLevel) || "inherit",
   };
-  config.compatibility = {
-    mode: normalizeCompatibilityMode(config.compatibility?.mode),
-  };
   return config;
 }
 
@@ -233,10 +270,11 @@ export async function loadConfig(options = {}) {
     process.env.CODEX_PROXY_CC_CONFIG ||
     defaultConfigPath();
 
-  const fileConfig = await readJsonIfPresent(configPath);
+  const fileConfig = normalizeLegacyConfig(await readJsonIfPresent(configPath));
   const baseConfig = deepMerge(DEFAULT_CONFIG, fileConfig);
-  const envConfig = envOverrides(baseConfig);
-  const merged = deepMerge(baseConfig, deepMerge(envConfig, options.overrides || {}));
+  const envConfig = normalizeLegacyConfig(envOverrides(baseConfig));
+  const cliConfig = normalizeLegacyConfig(options.overrides || {});
+  const merged = deepMerge(baseConfig, deepMerge(envConfig, cliConfig));
 
   return {
     config: validateConfig(merged),
@@ -245,7 +283,7 @@ export async function loadConfig(options = {}) {
       defaultConfig: DEFAULT_CONFIG,
       fileConfig,
       envConfig,
-      cliConfig: options.overrides || {},
+      cliConfig,
       baseConfig,
     },
   };
