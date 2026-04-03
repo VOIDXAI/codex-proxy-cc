@@ -6,6 +6,8 @@ import { connectCodexAppServer, getCodexLoginStatus } from "./codex-app-server-c
 import { resolveModelConfig } from "../adapters/model-mapping.mjs";
 
 const SYNTHETIC_OUTPUT_TOOL_NAME = "StructuredOutput";
+const RESERVED_DYNAMIC_TOOL_NAME_PREFIXES = ["mcp__"];
+const SAFE_DYNAMIC_TOOL_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,127}$/u;
 
 function stringifyBlock(value) {
   try {
@@ -507,23 +509,71 @@ function filterNativeAnthropicTools(tools = []) {
   return tools.filter(tool => tool?.name && tool.name !== SYNTHETIC_OUTPUT_TOOL_NAME);
 }
 
-function buildDynamicToolSpecs(tools = []) {
-  return filterNativeAnthropicTools(tools).map(tool => ({
-    name: tool.name,
-    description: tool.description || "",
-    inputSchema: tool.input_schema || {
-      type: "object",
-      properties: {},
-      additionalProperties: true,
-    },
-  }));
+function isReservedDynamicToolName(name) {
+  return RESERVED_DYNAMIC_TOOL_NAME_PREFIXES.some(prefix => name.startsWith(prefix));
+}
+
+function sanitizeDynamicToolAlias(name, index) {
+  const source = typeof name === "string" ? name : "";
+  const normalized = source
+    .replace(/[^A-Za-z0-9_-]+/gu, "_")
+    .replace(/_+/gu, "_")
+    .replace(/^_+|_+$/gu, "");
+  const base = normalized && /^[A-Za-z]/u.test(normalized) ? normalized : `tool_${normalized || index + 1}`;
+  return `frontend_${base}`.slice(0, 128);
+}
+
+function buildDynamicToolRegistry(tools = []) {
+  const originalToRegisteredName = new Map();
+  const registeredToOriginalName = new Map();
+  const usedNames = new Set();
+
+  const specs = filterNativeAnthropicTools(tools).map((tool, index) => {
+    const originalName = tool.name;
+    let registeredName =
+      SAFE_DYNAMIC_TOOL_NAME_PATTERN.test(originalName) &&
+      !isReservedDynamicToolName(originalName) &&
+      !usedNames.has(originalName)
+        ? originalName
+        : sanitizeDynamicToolAlias(originalName, index);
+
+    let suffix = 2;
+    while (usedNames.has(registeredName) || isReservedDynamicToolName(registeredName)) {
+      const trimmed = sanitizeDynamicToolAlias(originalName, index).slice(0, Math.max(1, 124 - String(suffix).length));
+      registeredName = `${trimmed}_${suffix}`;
+      suffix += 1;
+    }
+
+    usedNames.add(registeredName);
+    originalToRegisteredName.set(originalName, registeredName);
+    registeredToOriginalName.set(registeredName, originalName);
+
+    const descriptionPrefix =
+      registeredName === originalName ? "" : `Original frontend tool name: ${originalName}\n\n`;
+
+    return {
+      name: registeredName,
+      description: `${descriptionPrefix}${tool.description || ""}`.trim(),
+      inputSchema: tool.input_schema || {
+        type: "object",
+        properties: {},
+        additionalProperties: true,
+      },
+    };
+  });
+
+  return {
+    specs,
+    originalToRegisteredName,
+    registeredToOriginalName,
+  };
 }
 
 function hasNativeAnthropicTools(body) {
-  return buildDynamicToolSpecs(body?.tools || []).length > 0;
+  return buildDynamicToolRegistry(body?.tools || []).specs.length > 0;
 }
 
-function buildToolChoiceInstructions(toolChoice) {
+function buildToolChoiceInstructions(toolChoice, originalToRegisteredName = new Map()) {
   if (!toolChoice || typeof toolChoice !== "object") {
     return "";
   }
@@ -534,12 +584,122 @@ function buildToolChoiceInstructions(toolChoice) {
     case "any":
       return "You must call at least one frontend tool before your final response.";
     case "tool":
-      return toolChoice.name
-        ? `You must call the frontend tool '${toolChoice.name}' before your final response.`
-        : "You must call the explicitly selected frontend tool before your final response.";
+      if (toolChoice.name) {
+        const registeredName = originalToRegisteredName.get(toolChoice.name) || toolChoice.name;
+        return registeredName === toolChoice.name
+          ? `You must call the frontend tool '${toolChoice.name}' before your final response.`
+          : `You must call the frontend tool '${toolChoice.name}' before your final response. In the registered Codex tool list, this tool appears as '${registeredName}'.`;
+      }
+      return "You must call the explicitly selected frontend tool before your final response.";
     default:
       return "";
   }
+}
+
+function buildDynamicToolAliasInstructions(originalToRegisteredName = new Map()) {
+  const aliases = [...originalToRegisteredName.entries()].filter(([originalName, registeredName]) => {
+    return originalName !== registeredName;
+  });
+  if (aliases.length === 0) {
+    return "";
+  }
+
+  return [
+    "Frontend tool registration aliases:",
+    ...aliases.map(([originalName, registeredName]) => `- ${originalName} -> ${registeredName}`),
+    "When calling a tool, use the registered alias shown above.",
+  ].join("\n");
+}
+
+function resolveOriginalToolName(toolName, registeredToOriginalName = new Map()) {
+  if (!toolName) {
+    return toolName;
+  }
+  return registeredToOriginalName.get(toolName) || toolName;
+}
+
+function buildAnthropicToolUseResponse(toolName, input, externalModel, usage = {}, options = {}) {
+  return {
+    id: `msg_${crypto.randomUUID()}`,
+    type: "message",
+    role: "assistant",
+    model: externalModel,
+    content: [
+      {
+        type: "tool_use",
+        id: options.toolUseId || `toolu_${crypto.randomUUID()}`,
+        name: toolName,
+        input,
+      },
+    ],
+    stop_reason: "tool_use",
+    stop_sequence: null,
+    usage: {
+      input_tokens: usage.input_tokens ?? 0,
+      output_tokens: usage.output_tokens ?? approximateTokensFromText(JSON.stringify(input)),
+    },
+  };
+}
+
+function buildAnthropicEmptyResponse(externalModel, usage = {}) {
+  return {
+    id: `msg_${crypto.randomUUID()}`,
+    type: "message",
+    role: "assistant",
+    model: externalModel,
+    content: [],
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: {
+      input_tokens: usage.input_tokens ?? 0,
+      output_tokens: usage.output_tokens ?? 0,
+    },
+  };
+}
+
+function findToolByName(tools = [], name) {
+  return tools.find(tool => tool?.name === name) || null;
+}
+
+function findLastToolUseId(messages = [], toolName) {
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const message = messages[messageIndex];
+    const content = normalizeMessageContent(message?.content);
+    for (let blockIndex = content.length - 1; blockIndex >= 0; blockIndex -= 1) {
+      const block = content[blockIndex];
+      if (block?.type === "tool_use" && block?.name === toolName && typeof block.id === "string") {
+        return block.id;
+      }
+    }
+  }
+  return null;
+}
+
+function isSuccessfulToolResultBlock(block, expectedToolUseId) {
+  return (
+    block?.type === "tool_result" &&
+    block.tool_use_id === expectedToolUseId &&
+    block.is_error !== true
+  );
+}
+
+function shouldFinalizeStructuredOutputTurn(messages = []) {
+  const toolUseId = findLastToolUseId(messages, SYNTHETIC_OUTPUT_TOOL_NAME);
+  if (!toolUseId || messages.length === 0) {
+    return false;
+  }
+
+  const lastMessage = messages[messages.length - 1];
+  if (lastMessage?.role !== "user") {
+    return false;
+  }
+
+  const blocks = normalizeMessageContent(lastMessage.content);
+  if (blocks.length === 0) {
+    return false;
+  }
+
+  return blocks.every(block => isSuccessfulToolResultBlock(block, toolUseId));
 }
 
 function buildToolResultContentItems(content) {
@@ -626,7 +786,14 @@ function buildCodexPromptFromAnthropic(body, config, options = {}) {
   const outputInstructions = buildStructuredOutputInstructions(body?.output_config?.format);
   const outputSchema = mapCodexOutputSchema(body?.output_config?.format);
   const nativeToolBridge = Boolean(options.nativeToolBridge);
-  const toolChoiceInstructions = buildToolChoiceInstructions(body?.tool_choice);
+  const dynamicToolRegistry = options.dynamicToolRegistry || buildDynamicToolRegistry(body?.tools || []);
+  const toolChoiceInstructions = buildToolChoiceInstructions(
+    body?.tool_choice,
+    dynamicToolRegistry.originalToRegisteredName,
+  );
+  const dynamicToolAliasInstructions = nativeToolBridge
+    ? buildDynamicToolAliasInstructions(dynamicToolRegistry.originalToRegisteredName)
+    : "";
 
   const prompt = [
     "You are the model sampler behind a Claude Code session.",
@@ -640,6 +807,7 @@ function buildCodexPromptFromAnthropic(body, config, options = {}) {
     toolChoiceInstructions,
     "Do not mention backend routing, Anthropic, OpenAI, or internal implementation details.",
     "Return only the assistant response that should be shown to the user.",
+    dynamicToolAliasInstructions ? `\nFrontend tool alias notes:\n${dynamicToolAliasInstructions}` : "",
     systemText ? `\nSystem instructions:\n${systemText}` : "",
     outputInstructions ? `\nOutput requirements:\n${outputInstructions}` : "",
     transcript ? `\nClaude Code transcript:\n${transcript}` : "",
@@ -653,6 +821,7 @@ function buildCodexPromptFromAnthropic(body, config, options = {}) {
     externalModel: body.model,
     resolvedModel,
     transcriptMessages,
+    dynamicToolRegistry,
   };
 }
 
@@ -679,90 +848,6 @@ function buildAnthropicTextResponse(text, externalModel, usage = {}) {
       output_tokens: usage.output_tokens ?? approximateTokensFromText(text),
     },
   };
-}
-
-function buildAnthropicToolUseResponse(toolName, input, externalModel, usage = {}, options = {}) {
-  return {
-    id: `msg_${crypto.randomUUID()}`,
-    type: "message",
-    role: "assistant",
-    model: externalModel,
-    content: [
-      {
-        type: "tool_use",
-        id: options.toolUseId || `toolu_${crypto.randomUUID()}`,
-        name: toolName,
-        input,
-      },
-    ],
-    stop_reason: "tool_use",
-    stop_sequence: null,
-    usage: {
-      input_tokens: usage.input_tokens ?? 0,
-      output_tokens: usage.output_tokens ?? approximateTokensFromText(JSON.stringify(input)),
-    },
-  };
-}
-
-function buildAnthropicEmptyResponse(externalModel, usage = {}) {
-  return {
-    id: `msg_${crypto.randomUUID()}`,
-    type: "message",
-    role: "assistant",
-    model: externalModel,
-    content: [],
-    stop_reason: "end_turn",
-    stop_sequence: null,
-    usage: {
-      input_tokens: usage.input_tokens ?? 0,
-      output_tokens: usage.output_tokens ?? 0,
-    },
-  };
-}
-
-function findToolByName(tools = [], name) {
-  return tools.find(tool => tool?.name === name) || null;
-}
-
-function findLastToolUseId(messages = [], toolName) {
-  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
-    const message = messages[messageIndex];
-    const content = normalizeMessageContent(message?.content);
-    for (let blockIndex = content.length - 1; blockIndex >= 0; blockIndex -= 1) {
-      const block = content[blockIndex];
-      if (block?.type === "tool_use" && block?.name === toolName && typeof block.id === "string") {
-        return block.id;
-      }
-    }
-  }
-  return null;
-}
-
-function isSuccessfulToolResultBlock(block, expectedToolUseId) {
-  return (
-    block?.type === "tool_result" &&
-    block.tool_use_id === expectedToolUseId &&
-    block.is_error !== true
-  );
-}
-
-function shouldFinalizeStructuredOutputTurn(messages = []) {
-  const toolUseId = findLastToolUseId(messages, SYNTHETIC_OUTPUT_TOOL_NAME);
-  if (!toolUseId || messages.length === 0) {
-    return false;
-  }
-
-  const lastMessage = messages[messages.length - 1];
-  if (lastMessage?.role !== "user") {
-    return false;
-  }
-
-  const blocks = normalizeMessageContent(lastMessage.content);
-  if (blocks.length === 0) {
-    return false;
-  }
-
-  return blocks.every(block => isSuccessfulToolResultBlock(block, toolUseId));
 }
 
 function parseStructuredOutputInput(text, format) {
@@ -1304,7 +1389,7 @@ async function runCodexTurn({
   }
 }
 
-async function createAppServerCodexTurnController({
+export async function createAppServerCodexTurnController({
   config,
   logger,
   prompt,
@@ -1316,8 +1401,10 @@ async function createAppServerCodexTurnController({
   onEvent,
   threadContext,
   dynamicTools = [],
+  registeredToOriginalToolName = new Map(),
+  connectAppServer = connectCodexAppServer,
 }) {
-  const client = await connectCodexAppServer(cwd, {
+  const client = await connectAppServer(cwd, {
     command: config.codex.binary,
     env: process.env,
     capabilities:
@@ -1350,7 +1437,7 @@ async function createAppServerCodexTurnController({
     },
   });
   let stopSignal = createDeferred();
-  let pendingToolRequest = null;
+  const pendingToolRequests = [];
 
   function resolveStop(payload) {
     stopSignal.resolve(payload);
@@ -1358,6 +1445,39 @@ async function createAppServerCodexTurnController({
 
   function rejectStop(error) {
     stopSignal.reject(error);
+  }
+
+  function buildToolRequestOutcome(request) {
+    return {
+      type: "tool_request",
+      toolCall: {
+        id: request.callId,
+        name: resolveOriginalToolName(request.tool, registeredToOriginalToolName),
+        input: request.arguments,
+      },
+      usage: {
+        ...usage,
+      },
+      threadId,
+      threadPath,
+      turnId,
+      model,
+    };
+  }
+
+  function currentPendingToolRequest() {
+    return pendingToolRequests[0] || null;
+  }
+
+  function emitNextPendingToolRequest() {
+    const request = currentPendingToolRequest();
+    if (!request || request.emitted || completed || closed) {
+      return false;
+    }
+
+    request.emitted = true;
+    resolveStop(buildToolRequestOutcome(request));
+    return true;
   }
 
   try {
@@ -1374,29 +1494,14 @@ async function createAppServerCodexTurnController({
       }
 
       const responseSignal = createDeferred();
-      pendingToolRequest = {
+      pendingToolRequests.push({
         requestId: message.id,
         callId: message.params?.callId,
         tool: message.params?.tool,
         arguments: message.params?.arguments ?? {},
         responseSignal,
-      };
-
-      resolveStop({
-        type: "tool_request",
-        toolCall: {
-          id: pendingToolRequest.callId,
-          name: pendingToolRequest.tool,
-          input: pendingToolRequest.arguments,
-        },
-        usage: {
-          ...usage,
-        },
-        threadId,
-        threadPath,
-        turnId,
-        model,
       });
+      emitNextPendingToolRequest();
 
       return responseSignal.promise;
     });
@@ -1533,20 +1638,23 @@ async function createAppServerCodexTurnController({
       return stopSignal.promise;
     },
     async resumeWithToolResult(toolResult) {
-      if (!pendingToolRequest) {
+      const activeRequest = pendingToolRequests.shift();
+      if (!activeRequest) {
         throw new AppError("No pending tool request to resume", {
           status: 400,
           type: "invalid_request_error",
         });
       }
 
-      const activeRequest = pendingToolRequest;
-      pendingToolRequest = null;
       stopSignal = createDeferred();
       activeRequest.responseSignal.resolve(toolResult);
+      queueMicrotask(() => {
+        emitNextPendingToolRequest();
+      });
       return stopSignal.promise;
     },
     getPendingToolRequest() {
+      const pendingToolRequest = currentPendingToolRequest();
       return pendingToolRequest
         ? {
             callId: pendingToolRequest.callId,
@@ -1574,14 +1682,14 @@ async function createAppServerCodexTurnController({
         return;
       }
       closed = true;
-      if (pendingToolRequest) {
+      for (const pendingToolRequest of pendingToolRequests.splice(0)) {
+        pendingToolRequest.responseSignal.promise.catch(() => {});
         pendingToolRequest.responseSignal.reject(
           new AppError("Codex tool bridge session was closed before the tool result arrived", {
             status: 499,
             type: "api_error",
           }),
         );
-        pendingToolRequest = null;
       }
       await client.close();
     },
@@ -2054,14 +2162,46 @@ export function createCodexBackend({
 } = {}) {
   const pendingToolSessions = new Map();
 
-  async function closePendingToolSession(key) {
-    const pendingSession = pendingToolSessions.get(key);
-    if (!pendingSession) {
+  function getPendingToolSessions(key) {
+    const pendingSessions = pendingToolSessions.get(key);
+    return Array.isArray(pendingSessions) ? pendingSessions : [];
+  }
+
+  function setPendingToolSessions(key, pendingSessions) {
+    if (!Array.isArray(pendingSessions) || pendingSessions.length === 0) {
+      pendingToolSessions.delete(key);
+      return;
+    }
+    pendingToolSessions.set(key, pendingSessions);
+  }
+
+  function addPendingToolSession(key, pendingSession) {
+    const pendingSessions = getPendingToolSessions(key);
+    setPendingToolSessions(key, [...pendingSessions, pendingSession]);
+  }
+
+  function removePendingToolSession(key, pendingSession) {
+    const pendingSessions = getPendingToolSessions(key);
+    if (pendingSessions.length === 0) {
+      return;
+    }
+    setPendingToolSessions(
+      key,
+      pendingSessions.filter(entry => entry !== pendingSession),
+    );
+  }
+
+  async function closePendingToolSession(key, pendingSession = null) {
+    const pendingSessions = getPendingToolSessions(key);
+    if (pendingSessions.length === 0) {
       return;
     }
 
-    pendingToolSessions.delete(key);
-    await pendingSession.controller.close();
+    const sessionsToClose = pendingSession ? pendingSessions.filter(entry => entry === pendingSession) : pendingSessions;
+    const sessionsToKeep = pendingSession ? pendingSessions.filter(entry => entry !== pendingSession) : [];
+
+    setPendingToolSessions(key, sessionsToKeep);
+    await Promise.all(sessionsToClose.map(entry => entry.controller.close()));
   }
 
   async function awaitControllerStop(stopPromise) {
@@ -2070,29 +2210,30 @@ export function createCodexBackend({
 
   async function continuePendingToolSession(body, onEvent) {
     const key = pendingToolSessionKey(body);
-    const pendingSession = pendingToolSessions.get(key);
+    const pendingSessions = getPendingToolSessions(key);
+    if (pendingSessions.length === 0) {
+      return null;
+    }
+
+    const pendingSession = [...pendingSessions]
+      .reverse()
+      .find(session => buildDynamicToolResponseFromAnthropic(body, session.toolCall.id));
     if (!pendingSession) {
+      logger?.debug?.("No matching tool_result found for pending Codex tool bridge sessions", {
+        sessionKey: key,
+        pendingSessionCount: pendingSessions.length,
+      });
       return null;
     }
 
     pendingSession.controller.setOnEvent(onEvent);
     const toolResult = buildDynamicToolResponseFromAnthropic(body, pendingSession.toolCall.id);
-    if (!toolResult) {
-      logger?.warn?.("Discarding stale pending Codex tool bridge session without a matching tool_result", {
-        sessionKey: key,
-        expectedToolUseId: pendingSession.toolCall.id,
-      });
-      await closePendingToolSession(key);
-      return null;
-    }
-
     try {
       const outcome = await awaitControllerStop(pendingSession.controller.resumeWithToolResult(toolResult));
       if (outcome.type === "tool_request") {
         pendingSession.toolCall = outcome.toolCall;
-        pendingToolSessions.set(key, pendingSession);
       } else {
-        pendingToolSessions.delete(key);
+        removePendingToolSession(key, pendingSession);
       }
 
       return {
@@ -2101,7 +2242,7 @@ export function createCodexBackend({
         outcome,
       };
     } catch (error) {
-      await closePendingToolSession(key);
+      await closePendingToolSession(key, pendingSession);
       throw error;
     }
   }
@@ -2112,10 +2253,10 @@ export function createCodexBackend({
     prompt,
     outputSchema,
     resolvedModel,
+    dynamicToolRegistry,
     thinkingEnabled,
     onEvent,
   }) {
-    const dynamicTools = buildDynamicToolSpecs(body?.tools || []);
     const controller = await createCodexTurnController({
       config,
       logger,
@@ -2129,7 +2270,8 @@ export function createCodexBackend({
         threadId: sessionContext.resumeThreadId,
         threadPath: sessionContext.resumeThreadPath,
       },
-      dynamicTools,
+      dynamicTools: dynamicToolRegistry.specs,
+      registeredToOriginalToolName: dynamicToolRegistry.registeredToOriginalName,
       createTurnController,
     });
 
@@ -2215,11 +2357,15 @@ export function createCodexBackend({
         sessionStore,
       });
       const toolBridgeEnabled = hasNativeAnthropicTools(body);
-      const { prompt, outputSchema, externalModel, resolvedModel } = buildCodexPromptFromAnthropic(body, config, {
-        logger,
-        messages: sessionContext.promptMessages,
-        nativeToolBridge: toolBridgeEnabled,
-      });
+      const { prompt, outputSchema, externalModel, resolvedModel, dynamicToolRegistry } = buildCodexPromptFromAnthropic(
+        body,
+        config,
+        {
+          logger,
+          messages: sessionContext.promptMessages,
+          nativeToolBridge: toolBridgeEnabled,
+        },
+      );
       if (shouldFinalizeStructuredOutputTurn(body.messages)) {
         logger?.debug?.("Finalizing structured output turn without another Codex request", {
           model: body.model,
@@ -2240,11 +2386,12 @@ export function createCodexBackend({
           prompt,
           outputSchema,
           resolvedModel,
+          dynamicToolRegistry,
           thinkingEnabled: isThinkingEnabled(body),
         });
 
         if (outcome.type === "tool_request") {
-          pendingToolSessions.set(pendingToolSessionKey(body), {
+          addPendingToolSession(pendingToolSessionKey(body), {
             controller,
             toolCall: outcome.toolCall,
           });
@@ -2414,11 +2561,12 @@ export function createCodexBackend({
           sessionStore,
           body,
         });
-        const { prompt, outputSchema, externalModel, resolvedModel } = buildCodexPromptFromAnthropic(body, config, {
-          logger,
-          messages: sessionContext.promptMessages,
-          nativeToolBridge: toolBridgeEnabled,
-        });
+        const { prompt, outputSchema, externalModel, resolvedModel, dynamicToolRegistry } =
+          buildCodexPromptFromAnthropic(body, config, {
+            logger,
+            messages: sessionContext.promptMessages,
+            nativeToolBridge: toolBridgeEnabled,
+          });
         if (shouldFinalizeStructuredOutputTurn(body.messages)) {
           logger?.debug?.("Finalizing structured output turn without another Codex request", {
             model: body.model,
@@ -2451,12 +2599,13 @@ export function createCodexBackend({
             prompt,
             outputSchema,
             resolvedModel,
+            dynamicToolRegistry,
             thinkingEnabled,
             onEvent: streamBridge ? event => streamBridge.handle(event) : undefined,
           });
 
           if (outcome.type === "tool_request") {
-            pendingToolSessions.set(pendingToolSessionKey(body), {
+            addPendingToolSession(pendingToolSessionKey(body), {
               controller,
               toolCall: outcome.toolCall,
             });

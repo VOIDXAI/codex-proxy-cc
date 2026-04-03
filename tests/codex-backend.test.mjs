@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { createCodexBackend } from "../src/backends/codex-backend.mjs";
+import {
+  createAppServerCodexTurnController,
+  createCodexBackend,
+} from "../src/backends/codex-backend.mjs";
 import { DEFAULT_CONFIG } from "../src/config/defaults.mjs";
 import { parseSseStream } from "../src/gateway/sse.mjs";
 import { AppError } from "../src/shared/errors.mjs";
@@ -72,6 +75,171 @@ async function collectSseEvents(body) {
   }
   return events;
 }
+
+test("app-server turn controller queues concurrent tool calls instead of overwriting them", async () => {
+  let serverRequestHandler = null;
+  let notificationHandler = null;
+  const resumedToolResults = [];
+  const fakeClient = {
+    stderr: "",
+    setServerRequestHandler(handler) {
+      serverRequestHandler = handler;
+    },
+    setNotificationHandler(handler) {
+      notificationHandler = handler;
+    },
+    async request(method) {
+      switch (method) {
+        case "thread/start":
+          return {
+            thread: {
+              id: "thread_queue",
+              path: "/tmp/thread-queue.json",
+            },
+          };
+        case "turn/start":
+          queueMicrotask(() => {
+            const firstRequest = serverRequestHandler({
+              id: 1,
+              method: "item/tool/call",
+              params: {
+                callId: "call_queue_1",
+                tool: "Read",
+                arguments: {
+                  file_path: "README.md",
+                },
+              },
+            });
+            const secondRequest = serverRequestHandler({
+              id: 2,
+              method: "item/tool/call",
+              params: {
+                callId: "call_queue_2",
+                tool: "Glob",
+                arguments: {
+                  pattern: "src/**/*.mjs",
+                },
+              },
+            });
+
+            Promise.all([firstRequest, secondRequest])
+              .then(results => {
+                resumedToolResults.push(...results);
+                notificationHandler({
+                  method: "item/started",
+                  params: {
+                    item: {
+                      type: "agentMessage",
+                      id: "agent_queue_1",
+                      phase: "final_answer",
+                    },
+                  },
+                });
+                notificationHandler({
+                  method: "item/agentMessage/delta",
+                  params: {
+                    itemId: "agent_queue_1",
+                    delta: "plan-ready",
+                  },
+                });
+                notificationHandler({
+                  method: "item/completed",
+                  params: {
+                    item: {
+                      type: "agentMessage",
+                      id: "agent_queue_1",
+                      phase: "final_answer",
+                      text: "plan-ready",
+                    },
+                  },
+                });
+                notificationHandler({
+                  method: "turn/completed",
+                  params: {
+                    turn: {
+                      status: "completed",
+                    },
+                  },
+                });
+              })
+              .catch(() => {});
+          });
+          return {
+            turn: {
+              id: "turn_queue",
+            },
+          };
+        default:
+          throw new Error(`Unexpected app-server request: ${method}`);
+      }
+    },
+    async close() {},
+  };
+
+  const controller = await createAppServerCodexTurnController({
+    config: DEFAULT_CONFIG,
+    logger: null,
+    prompt: "Plan the implementation.",
+    model: "gpt-5.4",
+    effort: "medium",
+    cwd: process.cwd(),
+    outputSchema: null,
+    summary: "none",
+    dynamicTools: [
+      {
+        name: "Read",
+        inputSchema: {
+          type: "object",
+          properties: {
+            file_path: { type: "string" },
+          },
+        },
+      },
+      {
+        name: "Glob",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pattern: { type: "string" },
+          },
+        },
+      },
+    ],
+    connectAppServer: async () => fakeClient,
+  });
+
+  const firstOutcome = await controller.waitForStop();
+  assert.equal(firstOutcome.type, "tool_request");
+  assert.equal(firstOutcome.toolCall.id, "call_queue_1");
+  assert.equal(firstOutcome.toolCall.name, "Read");
+
+  const secondOutcome = await controller.resumeWithToolResult({
+    contentItems: [{ type: "inputText", text: "README body" }],
+    success: true,
+  });
+  assert.equal(secondOutcome.type, "tool_request");
+  assert.equal(secondOutcome.toolCall.id, "call_queue_2");
+  assert.equal(secondOutcome.toolCall.name, "Glob");
+
+  const completion = await controller.resumeWithToolResult({
+    contentItems: [{ type: "inputText", text: "src/backends/codex-backend.mjs" }],
+    success: true,
+  });
+  assert.equal(completion.type, "completed");
+  assert.equal(completion.result.finalMessage, "plan-ready");
+  assert.deepEqual(resumedToolResults, [
+    {
+      contentItems: [{ type: "inputText", text: "README body" }],
+      success: true,
+    },
+    {
+      contentItems: [{ type: "inputText", text: "src/backends/codex-backend.mjs" }],
+      success: true,
+    },
+  ]);
+
+  await controller.close();
+});
 
 test("codex backend preserves tool_use and tool_result history in its prompt transcript", async () => {
   const calls = [];
@@ -243,6 +411,239 @@ test("codex backend bridges native Anthropic tools through Codex dynamic tool ca
   assert.equal(harness.controllers[0].closed, true);
 });
 
+test("codex backend keeps unrelated pending tool sessions alive within the same Claude session", async () => {
+  const harness = createTurnControllerHarness([
+    {
+      model: "gpt-5.4",
+      outcomes: [
+        {
+          value: {
+            type: "tool_request",
+            toolCall: {
+              id: "call_parent_1",
+              name: "Explore",
+              input: { task: "Inspect repo structure" },
+            },
+            usage: {
+              input_tokens: 14,
+              output_tokens: 1,
+            },
+          },
+        },
+        {
+          value: {
+            type: "completed",
+            result: {
+              threadId: "thread_parent",
+              threadPath: "/tmp/thread-parent.json",
+              model: "gpt-5.4",
+              finalMessage: "parent-complete",
+              usage: {
+                input_tokens: 21,
+                output_tokens: 5,
+              },
+              reasoningSummaries: [],
+            },
+          },
+        },
+      ],
+    },
+    {
+      model: "gpt-5.4",
+      outcomes: [
+        {
+          value: {
+            type: "tool_request",
+            toolCall: {
+              id: "call_child_1",
+              name: "Read",
+              input: { file_path: "README.md" },
+            },
+            usage: {
+              input_tokens: 9,
+              output_tokens: 1,
+            },
+          },
+        },
+      ],
+    },
+  ]);
+  const backend = createCodexBackend({
+    config: DEFAULT_CONFIG,
+    logger: null,
+    createTurnController: harness.createTurnController,
+  });
+
+  const parentResponse = await backend.createMessage({
+    model: "sonnet",
+    _codexProxyCc: {
+      sessionId: "shared-parent-child-session",
+    },
+    messages: [{ role: "user", content: "Analyze this project at a high level." }],
+    tools: [
+      {
+        name: "Explore",
+        description: "Inspect repository structure",
+        input_schema: {
+          type: "object",
+          properties: {
+            task: { type: "string" },
+          },
+          required: ["task"],
+          additionalProperties: false,
+        },
+      },
+    ],
+  });
+
+  const childResponse = await backend.createMessage({
+    model: "sonnet",
+    _codexProxyCc: {
+      sessionId: "shared-parent-child-session",
+    },
+    messages: [{ role: "user", content: "Open README.md and summarize it." }],
+    tools: [
+      {
+        name: "Read",
+        description: "Read a file from the workspace",
+        input_schema: {
+          type: "object",
+          properties: {
+            file_path: { type: "string" },
+          },
+          required: ["file_path"],
+          additionalProperties: false,
+        },
+      },
+    ],
+  });
+
+  assert.equal(parentResponse.stop_reason, "tool_use");
+  assert.equal(parentResponse.content[0].id, "call_parent_1");
+  assert.equal(childResponse.stop_reason, "tool_use");
+  assert.equal(childResponse.content[0].id, "call_child_1");
+  assert.equal(harness.controllers.length, 2);
+  assert.equal(harness.controllers[0].closed, false);
+  assert.equal(harness.controllers[1].closed, false);
+
+  const resumedParentResponse = await backend.createMessage({
+    model: "sonnet",
+    _codexProxyCc: {
+      sessionId: "shared-parent-child-session",
+    },
+    messages: [
+      { role: "user", content: "Analyze this project at a high level." },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "call_parent_1",
+            name: "Explore",
+            input: { task: "Inspect repo structure" },
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "call_parent_1",
+            content: [{ type: "text", text: "Parent tool result" }],
+          },
+        ],
+      },
+    ],
+    tools: [
+      {
+        name: "Explore",
+        description: "Inspect repository structure",
+        input_schema: {
+          type: "object",
+          properties: {
+            task: { type: "string" },
+          },
+          required: ["task"],
+          additionalProperties: false,
+        },
+      },
+    ],
+  });
+
+  assert.equal(resumedParentResponse.stop_reason, "end_turn");
+  assert.equal(resumedParentResponse.content[0].text, "parent-complete");
+  assert.deepEqual(harness.controllers[0].resumeInputs, [
+    {
+      contentItems: [{ type: "inputText", text: "Parent tool result" }],
+      success: true,
+    },
+  ]);
+  assert.deepEqual(harness.controllers[1].resumeInputs, []);
+  assert.equal(harness.controllers[0].closed, true);
+  assert.equal(harness.controllers[1].closed, false);
+});
+
+test("codex backend aliases reserved Claude tool names before registering them with Codex", async () => {
+  const harness = createTurnControllerHarness([
+    {
+      model: "gpt-5.4",
+      outcomes: [
+        {
+          value: {
+            type: "tool_request",
+            toolCall: {
+              id: "call_gmail_auth_1",
+              name: "mcp__claude_ai_Gmail__authenticate",
+              input: {},
+            },
+            usage: {
+              input_tokens: 20,
+              output_tokens: 1,
+            },
+          },
+        },
+      ],
+    },
+  ]);
+  const backend = createCodexBackend({
+    config: DEFAULT_CONFIG,
+    logger: null,
+    createTurnController: harness.createTurnController,
+  });
+
+  const firstResponse = await backend.createMessage({
+    model: "sonnet",
+    _codexProxyCc: {
+      sessionId: "reserved-tool-session-1",
+    },
+    messages: [{ role: "user", content: "Authenticate Gmail and then analyze this repo." }],
+    tools: [
+      {
+        name: "mcp__claude_ai_Gmail__authenticate",
+        description: "Authenticate the Gmail MCP server",
+        input_schema: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
+      },
+    ],
+  });
+
+  assert.equal(firstResponse.stop_reason, "tool_use");
+  assert.equal(firstResponse.content[0].name, "mcp__claude_ai_Gmail__authenticate");
+  assert.match(harness.controllers[0].input.prompt, /Frontend tool alias notes:/);
+  assert.match(
+    harness.controllers[0].input.prompt,
+    /mcp__claude_ai_Gmail__authenticate -> frontend_mcp_claude_ai_Gmail_authenticate/u,
+  );
+  assert.equal(
+    harness.controllers[0].input.dynamicTools[0].name,
+    "frontend_mcp_claude_ai_Gmail_authenticate",
+  );
+});
+
 test("codex backend rebinds streamed native tool resumes onto the current response", async () => {
   const harness = createTurnControllerHarness([
     {
@@ -382,6 +783,80 @@ test("codex backend rebinds streamed native tool resumes onto the current respon
   assert.deepEqual(secondTextDeltas, ["delta-answer"]);
   assert.equal(harness.controllers[0].setOnEventCalls, 1);
   assert.equal(harness.controllers[0].closed, true);
+});
+
+test("app-server turn controller remaps aliased tool calls back to the original Claude tool name", async () => {
+  let serverRequestHandler = null;
+  const fakeClient = {
+    stderr: "",
+    setServerRequestHandler(handler) {
+      serverRequestHandler = handler;
+    },
+    setNotificationHandler() {},
+    async request(method, params) {
+      switch (method) {
+        case "thread/start":
+          return {
+            thread: {
+              id: "thread_alias",
+              path: "/tmp/thread-alias.json",
+            },
+          };
+        case "turn/start":
+          queueMicrotask(() => {
+            void serverRequestHandler({
+              id: 1,
+              method: "item/tool/call",
+              params: {
+                callId: "call_alias_1",
+                tool: params.threadId ? "frontend_mcp_claude_ai_Gmail_authenticate" : "unexpected",
+                arguments: {},
+              },
+            }).catch(() => {});
+          });
+          return {
+            turn: {
+              id: "turn_alias",
+            },
+          };
+        default:
+          throw new Error(`Unexpected app-server request: ${method}`);
+      }
+    },
+    async close() {},
+  };
+
+  const controller = await createAppServerCodexTurnController({
+    config: DEFAULT_CONFIG,
+    logger: null,
+    prompt: "Use the Gmail auth tool.",
+    model: "gpt-5.4",
+    effort: "medium",
+    cwd: process.cwd(),
+    outputSchema: null,
+    dynamicTools: [
+      {
+        name: "frontend_mcp_claude_ai_Gmail_authenticate",
+        description: "Original frontend tool name: mcp__claude_ai_Gmail__authenticate",
+        inputSchema: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
+      },
+    ],
+    registeredToOriginalToolName: new Map([
+      ["frontend_mcp_claude_ai_Gmail_authenticate", "mcp__claude_ai_Gmail__authenticate"],
+    ]),
+    connectAppServer: async () => fakeClient,
+  });
+
+  const outcome = await controller.waitForStop();
+  assert.equal(outcome.type, "tool_request");
+  assert.equal(outcome.toolCall.id, "call_alias_1");
+  assert.equal(outcome.toolCall.name, "mcp__claude_ai_Gmail__authenticate");
+
+  await controller.close();
 });
 
 test("codex backend serializes native Claude-only input blocks into the prompt transcript", async () => {
