@@ -1,0 +1,16 @@
+node_modules/
+.DS_Store
+Thumbs.db
+*.log
+coverage/
+.nyc_output/
+.tmp/
+tmp/
+dist/
+.claude/
+.codex
+.easy-loop/
+.env
+.env.*
+.idea/
+.vscode/

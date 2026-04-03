@@ -1,0 +1,28 @@
+{
+  "name": "codex-proxy-cc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Run Claude Code through a local Anthropic-compatible gateway backed by Codex OAuth or the OpenAI Responses API.",
+  "author": "VOIDXAI",
+  "license": "MIT",
+  "keywords": [
+    "agentic-coding",
+    "anthropic-compatible",
+    "claude-code",
+    "codex",
+    "developer-tools",
+    "gateway",
+    "openai",
+    "proxy"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "codex-proxy-cc": "./bin/codex-proxy-cc.mjs"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  }
+}
