@@ -226,8 +226,8 @@ Environment overrides:
 
 - the runtime is tuned for current Claude Code behavior first
 - the proxy does not try to be a full general-purpose Anthropic replacement
-- earlier Claude transcript history is still reconstructed for sampling, although the latest user turn is forwarded as structured Codex input items when possible
-- transport continuity still keeps a tiny local cache for Codex thread reuse, but it now stores message fingerprints and thread metadata rather than full conversation snapshots
+- earlier Claude transcript history is still reconstructed for sampling, while the latest user turn is forwarded as structured Codex input items for text, image, and document-style inputs
+- transport continuity still keeps a tiny local cache for Codex thread reuse, but it stores only message fingerprints, message counts, and thread metadata rather than full conversation snapshots
 
 ## Development
 
