@@ -56,11 +56,16 @@ export function buildClaudeEnv({
   const defaultHaikuModel = resolveModelConfig(config, "haiku").targetModel;
   const defaultSonnetModel = resolveModelConfig(config, "sonnet").targetModel;
   const defaultOpusModel = resolveModelConfig(config, "opus").targetModel;
-  const shouldInjectGatewayToken = !isLoopbackGatewayUrl(gatewayUrl);
+  const loopbackGateway = isLoopbackGatewayUrl(gatewayUrl);
+  const shouldInjectGatewayToken = !loopbackGateway;
+  const proxyBypassEnv = loopbackGateway
+    ? buildLoopbackProxyBypassEnv(parentEnv)
+    : {};
 
   return {
     ...parentEnv,
     ANTHROPIC_BASE_URL: gatewayUrl,
+    ...proxyBypassEnv,
     ...(shouldInjectGatewayToken ? { ANTHROPIC_AUTH_TOKEN: localToken } : {}),
     ANTHROPIC_DEFAULT_HAIKU_MODEL: defaultHaikuModel,
     ANTHROPIC_DEFAULT_SONNET_MODEL: defaultSonnetModel,
@@ -77,7 +82,115 @@ export function buildClaudeEnv({
   };
 }
 
-function isLoopbackGatewayUrl(gatewayUrl) {
+function buildLoopbackProxyBypassEnv(parentEnv) {
+  const loopbackHosts = ["127.0.0.1", "localhost", "::1"];
+  const mergedNoProxy = mergeNoProxyValues([
+    parentEnv.NO_PROXY,
+    parentEnv.no_proxy,
+  ], loopbackHosts);
+
+  return {
+    NO_PROXY: mergedNoProxy,
+    no_proxy: mergedNoProxy,
+  };
+}
+
+function mergeNoProxyValues(values, requiredHosts) {
+  const entries = values
+    .flatMap(value => String(value || "").split(","))
+    .map(value => value.trim())
+    .filter(Boolean);
+  const seen = new Set(entries.map(value => value.toLowerCase()));
+
+  for (const host of requiredHosts) {
+    const normalized = host.toLowerCase();
+    if (seen.has(normalized)) {
+      continue;
+    }
+    entries.push(host);
+    seen.add(normalized);
+  }
+
+  return entries.join(",");
+}
+
+export function inspectLoopbackProxyBypass({
+  parentEnv = process.env,
+  claudeEnv,
+  gatewayUrl,
+}) {
+  if (!isLoopbackGatewayUrl(gatewayUrl)) {
+    return {
+      relevant: false,
+      ok: true,
+      host: null,
+      proxySource: null,
+      proxyValue: null,
+      noProxy: null,
+    };
+  }
+
+  const host = getGatewayHostname(gatewayUrl);
+  const proxySource = [
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+  ].find(name => {
+    const value = parentEnv[name];
+    return typeof value === "string" && value.trim();
+  }) || null;
+
+  const noProxy = claudeEnv.NO_PROXY || claudeEnv.no_proxy || "";
+
+  if (!proxySource) {
+    return {
+      relevant: false,
+      ok: true,
+      host,
+      proxySource: null,
+      proxyValue: null,
+      noProxy,
+    };
+  }
+
+  const proxyValue = parentEnv[proxySource];
+  return {
+    relevant: true,
+    ok: noProxyContainsHost(noProxy, host),
+    host,
+    proxySource,
+    proxyValue,
+    noProxy,
+  };
+}
+
+function noProxyContainsHost(noProxyValue, host) {
+  const entries = String(noProxyValue || "")
+    .split(",")
+    .map(value => normalizeHostname(value.trim()))
+    .filter(Boolean);
+  return entries.includes(normalizeHostname(host));
+}
+
+function getGatewayHostname(gatewayUrl) {
+  try {
+    return normalizeHostname(new URL(gatewayUrl).hostname);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeHostname(hostname) {
+  return String(hostname || "")
+    .trim()
+    .replace(/^\[(.*)\]$/, "$1")
+    .toLowerCase();
+}
+
+export function isLoopbackGatewayUrl(gatewayUrl) {
   try {
     const { hostname } = new URL(gatewayUrl);
     return isLoopbackHost(hostname);
@@ -87,10 +200,11 @@ function isLoopbackGatewayUrl(gatewayUrl) {
 }
 
 function isLoopbackHost(hostname) {
+  const normalized = normalizeHostname(hostname);
   return (
-    hostname === "127.0.0.1" ||
-    hostname === "::1" ||
-    hostname === "localhost"
+    normalized === "127.0.0.1" ||
+    normalized === "::1" ||
+    normalized === "localhost"
   );
 }
 

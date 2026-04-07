@@ -9,6 +9,8 @@ import {
   buildClaudeEnv,
   findClaudeBinary,
   generateLocalGatewayToken,
+  inspectLoopbackProxyBypass,
+  isLoopbackGatewayUrl,
   parseClaudeLaunchHints,
 } from "../src/launcher/env.mjs";
 
@@ -100,6 +102,91 @@ test("buildClaudeEnv still injects a gateway auth token for non-loopback proxies
   });
 
   assert.equal(env.ANTHROPIC_AUTH_TOKEN, "token-123");
+});
+
+test("buildClaudeEnv bypasses HTTP proxies for loopback gateways", () => {
+  const env = buildClaudeEnv({
+    parentEnv: {
+      PATH: process.env.PATH || "",
+      HTTP_PROXY: "http://127.0.0.1:7897",
+      HTTPS_PROXY: "http://127.0.0.1:7897",
+      NO_PROXY: "example.com",
+    },
+    gatewayUrl: "http://127.0.0.1:43123",
+    localToken: "token-123",
+    config: DEFAULT_CONFIG,
+  });
+
+  assert.equal(env.NO_PROXY, "example.com,127.0.0.1,localhost,::1");
+  assert.equal(env.no_proxy, "example.com,127.0.0.1,localhost,::1");
+});
+
+test("buildClaudeEnv merges uppercase and lowercase no_proxy values without duplicates", () => {
+  const env = buildClaudeEnv({
+    parentEnv: {
+      PATH: process.env.PATH || "",
+      NO_PROXY: "example.com,localhost",
+      no_proxy: "internal.local,127.0.0.1",
+    },
+    gatewayUrl: "http://localhost:43123",
+    localToken: "token-123",
+    config: DEFAULT_CONFIG,
+  });
+
+  assert.equal(env.NO_PROXY, "example.com,localhost,internal.local,127.0.0.1,::1");
+  assert.equal(env.no_proxy, "example.com,localhost,internal.local,127.0.0.1,::1");
+});
+
+test("inspectLoopbackProxyBypass reports loopback proxy interception risk", () => {
+  const parentEnv = {
+    PATH: process.env.PATH || "",
+    HTTPS_PROXY: "http://127.0.0.1:7897",
+  };
+  const claudeEnv = {
+    ...parentEnv,
+    ANTHROPIC_BASE_URL: "http://127.0.0.1:43123",
+  };
+
+  const inspection = inspectLoopbackProxyBypass({
+    parentEnv,
+    claudeEnv,
+    gatewayUrl: "http://127.0.0.1:43123",
+  });
+
+  assert.equal(inspection.relevant, true);
+  assert.equal(inspection.ok, false);
+  assert.equal(inspection.host, "127.0.0.1");
+  assert.equal(inspection.proxySource, "HTTPS_PROXY");
+});
+
+test("inspectLoopbackProxyBypass accepts loopback bypass injected into Claude env", () => {
+  const parentEnv = {
+    PATH: process.env.PATH || "",
+    HTTPS_PROXY: "http://127.0.0.1:7897",
+  };
+  const claudeEnv = buildClaudeEnv({
+    parentEnv,
+    gatewayUrl: "http://127.0.0.1:43123",
+    localToken: "token-123",
+    config: DEFAULT_CONFIG,
+  });
+
+  const inspection = inspectLoopbackProxyBypass({
+    parentEnv,
+    claudeEnv,
+    gatewayUrl: "http://127.0.0.1:43123",
+  });
+
+  assert.equal(inspection.relevant, true);
+  assert.equal(inspection.ok, true);
+  assert.equal(inspection.host, "127.0.0.1");
+});
+
+test("isLoopbackGatewayUrl recognizes loopback gateway hosts", () => {
+  assert.equal(isLoopbackGatewayUrl("http://127.0.0.1:43123"), true);
+  assert.equal(isLoopbackGatewayUrl("http://localhost:43123"), true);
+  assert.equal(isLoopbackGatewayUrl("http://[::1]:43123"), true);
+  assert.equal(isLoopbackGatewayUrl("http://192.168.1.20:43123"), false);
 });
 
 test("parseClaudeLaunchHints reads --model and --effort passthrough flags", () => {

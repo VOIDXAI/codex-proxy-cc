@@ -76,6 +76,7 @@ test("doctor command prints a human-readable summary by default", async () => {
   assert.match(result.stdout, /Status: ok/);
   assert.match(result.stdout, /Runtime backend: codex/);
   assert.match(result.stdout, /Codex auth: logged in/);
+  assert.match(result.stdout, /Loopback proxy bypass: not needed/);
 });
 
 test("doctor command still prints JSON when --json is passed", async () => {
@@ -114,4 +115,56 @@ test("doctor command still prints JSON when --json is passed", async () => {
   assert.equal(payload.ok, true);
   assert.equal(payload.backend, "codex");
   assert.equal(payload.codexAuth.loggedIn, true);
+  assert.deepEqual(payload.proxyBypass, {
+    relevant: false,
+    ok: true,
+    host: "127.0.0.1",
+    proxySource: null,
+    proxyValue: null,
+    noProxy: "127.0.0.1,localhost,::1",
+  });
+});
+
+test("doctor command validates loopback proxy bypass when proxies are configured", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "codex-proxy-cc-cli-doctor-proxy-"));
+  const fakeClaude = await createMockCommand(
+    tempDir,
+    "fake-claude",
+    "#!/usr/bin/env node\nprocess.exit(0);\n",
+  );
+  const fakeCodex = await createMockCommand(
+    tempDir,
+    "fake-codex",
+    "#!/usr/bin/env node\nconst args = process.argv.slice(2);\nif (args[0] === 'login' && args[1] === 'status') {\n  console.log('Logged in');\n  process.exit(0);\n}\nif (args[0] === 'app-server') {\n  process.exit(0);\n}\nprocess.exit(0);\n",
+  );
+
+  const result = spawnSync(
+    process.execPath,
+    [
+      "./bin/codex-proxy-cc.mjs",
+      "doctor",
+      "--claude-binary",
+      fakeClaude,
+      "--codex-binary",
+      fakeCodex,
+      "--json",
+    ],
+    {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HTTPS_PROXY: "http://127.0.0.1:7897",
+      },
+    },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ok, true);
+  assert.equal(payload.proxyBypass.relevant, true);
+  assert.equal(payload.proxyBypass.ok, true);
+  assert.equal(payload.proxyBypass.host, "127.0.0.1");
+  assert.equal(payload.proxyBypass.proxySource, "HTTPS_PROXY");
+  assert.match(payload.proxyBypass.noProxy, /127\.0\.0\.1/);
 });

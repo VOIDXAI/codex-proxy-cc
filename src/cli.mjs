@@ -7,6 +7,7 @@ import {
   buildClaudeEnv,
   findClaudeBinary,
   generateLocalGatewayToken,
+  inspectLoopbackProxyBypass,
 } from "./launcher/env.mjs";
 import { launchClaude } from "./launcher/run.mjs";
 import { createLogger, defaultRuntimeLogFilePath } from "./shared/logging.mjs";
@@ -193,6 +194,7 @@ function buildDoctorIssues({
   claudeBinaryStatus,
   codexStatus,
   gatewayStatus,
+  proxyBypassStatus,
 }) {
   const issues = [];
 
@@ -204,6 +206,11 @@ function buildDoctorIssues({
   }
   if (gatewayStatus && !gatewayStatus.ok) {
     issues.push(`Gateway health check failed: ${gatewayStatus.error || "unknown error"}`);
+  }
+  if (proxyBypassStatus?.relevant && !proxyBypassStatus.ok) {
+    issues.push(
+      `Loopback gateway requests may be intercepted by ${proxyBypassStatus.proxySource}; effective NO_PROXY is missing ${proxyBypassStatus.host}.`,
+    );
   }
 
   return issues;
@@ -220,6 +227,13 @@ function printDoctorSummary(payload) {
       payload.gateway?.ok
         ? `${payload.gateway.url} (${payload.gateway.provider || "unknown"})`
         : payload.gateway?.url || payload.gateway?.error || "not started"
+    }`,
+    `Loopback proxy bypass: ${
+      !payload.proxyBypass?.relevant
+        ? "not needed"
+        : payload.proxyBypass.ok
+          ? `active for ${payload.proxyBypass.host}`
+          : `missing for ${payload.proxyBypass.host}`
     }`,
   ];
 
@@ -292,13 +306,33 @@ async function runDoctorCommand({ config, configPath, layers, logger, verbose, j
     health: null,
   };
   let gateway = null;
+  let proxyBypassStatus = {
+    relevant: false,
+    ok: true,
+    host: null,
+    proxySource: null,
+    proxyValue: null,
+    noProxy: null,
+  };
 
   if (selectedBackend) {
+    const localToken = generateLocalGatewayToken();
     try {
       gateway = await startGatewayServer({
         config,
         logger,
-        localToken: generateLocalGatewayToken(),
+        localToken,
+      });
+      const claudeEnv = buildClaudeEnv({
+        parentEnv: process.env,
+        gatewayUrl: gateway.url,
+        localToken,
+        config,
+      });
+      proxyBypassStatus = inspectLoopbackProxyBypass({
+        parentEnv: process.env,
+        claudeEnv,
+        gatewayUrl: gateway.url,
       });
       const response = await fetch(`${gateway.url}/healthz`);
       const health = await response.json();
@@ -326,15 +360,18 @@ async function runDoctorCommand({ config, configPath, layers, logger, verbose, j
     ok:
       claudeBinaryStatus.ok &&
       codexStatus.loggedIn &&
-      gatewayStatus.ok,
+      gatewayStatus.ok &&
+      (!proxyBypassStatus.relevant || proxyBypassStatus.ok),
     claudeBinary: claudeBinaryStatus,
     backend: selectedBackend || "codex",
     codexAuth: codexStatus,
     gateway: gatewayStatus,
+    proxyBypass: proxyBypassStatus,
     issues: buildDoctorIssues({
       claudeBinaryStatus,
       codexStatus,
       gatewayStatus,
+      proxyBypassStatus,
     }),
     ...(verbose ? { inspection, config } : {}),
   };
