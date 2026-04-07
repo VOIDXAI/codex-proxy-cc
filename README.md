@@ -19,7 +19,7 @@ That is the main daily-use command.
 
 ## Status
 
-The current mainline is designed around Claude Code `v2.1.88` source behavior and focuses on preserving native Claude Code experience while replacing the model runtime.
+The current mainline is designed around current Claude Code source behavior and focuses on preserving native Claude Code experience while replacing the model runtime.
 
 Working today:
 
@@ -27,9 +27,9 @@ Working today:
 - print mode
 - native `tool_use` / `tool_result` bridging
 - streaming text responses
-- `/plan` text streaming and reasoning summary streaming
+- `/plan` text streaming plus raw reasoning/thinking streaming when Codex exposes it
 - structured JSON output through Claude-style `output_config`
-- structured latest-turn forwarding for Claude text and image inputs
+- structured latest-turn forwarding for Claude text, image, and document-style inputs
 - Claude Code-owned `-c` / `--resume` flows
 
 Not a goal:
@@ -224,7 +224,7 @@ Environment overrides:
 
 ## Current Limits
 
-- the runtime is tuned for Claude Code `v2.1.88` behavior first
+- the runtime is tuned for current Claude Code behavior first
 - the proxy does not try to be a full general-purpose Anthropic replacement
 - earlier Claude transcript history is still reconstructed for sampling, although the latest user turn is forwarded as structured Codex input items when possible
 - transport continuity still keeps a tiny local cache for Codex thread reuse, but it now stores message fingerprints and thread metadata rather than full conversation snapshots

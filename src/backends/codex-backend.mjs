@@ -259,6 +259,60 @@ function mapCodexOutputSchema(format) {
   return null;
 }
 
+function extractReasoningTextsFromValue(value) {
+  if (!value) {
+    return [];
+  }
+  if (typeof value === "string") {
+    return [value];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap(item => extractReasoningTextsFromValue(item));
+  }
+  if (typeof value !== "object") {
+    return [];
+  }
+
+  const directText = [];
+  if (typeof value.text === "string") {
+    directText.push(value.text);
+  }
+  if (typeof value.reasoning === "string") {
+    directText.push(value.reasoning);
+  }
+  if (typeof value.content === "string" || Array.isArray(value.content)) {
+    directText.push(...extractReasoningTextsFromValue(value.content));
+  }
+
+  return directText;
+}
+
+function normalizeReasoningTextList(values = []) {
+  const normalized = [];
+  for (const value of values) {
+    if (typeof value !== "string") {
+      continue;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+      continue;
+    }
+    if (normalized[normalized.length - 1] === trimmed) {
+      continue;
+    }
+    normalized.push(trimmed);
+  }
+  return normalized;
+}
+
+function buildReasoningDisplayTexts({ reasoningTexts = [], reasoningSummaries = [] } = {}) {
+  const rawTexts = normalizeReasoningTextList(reasoningTexts);
+  if (rawTexts.length > 0) {
+    return rawTexts;
+  }
+  return normalizeReasoningTextList(reasoningSummaries);
+}
+
 function extractJsonCandidate(text) {
   const trimmed = String(text || "").trim();
   if (!trimmed) {
@@ -395,6 +449,20 @@ function buildCodexTurnInputItemsFromBlock(block, { logger } = {}) {
           {
             type: "image",
             url: block.source.url,
+          },
+        ];
+      }
+      if (
+        block.source?.type === "base64" &&
+        typeof block.source.data === "string" &&
+        block.source.data.trim() &&
+        typeof block.source.media_type === "string" &&
+        block.source.media_type.trim()
+      ) {
+        return [
+          {
+            type: "image",
+            url: `data:${block.source.media_type};base64,${block.source.data}`,
           },
         ];
       }
@@ -783,13 +851,18 @@ function approximateTokensFromTurnInput(turnInput = []) {
   }, 0);
 }
 
-function buildAnthropicTextResponse(text, externalModel, usage = {}) {
+function buildAnthropicTextResponse(text, externalModel, usage = {}, options = {}) {
+  const thinkingTexts = Array.isArray(options.thinkingTexts) ? options.thinkingTexts : [];
   return {
     id: `msg_${crypto.randomUUID()}`,
     type: "message",
     role: "assistant",
     model: externalModel,
     content: [
+      ...thinkingTexts.map(thinking => ({
+        type: "thinking",
+        thinking,
+      })),
       {
         type: "text",
         text: text || "",
@@ -806,11 +879,19 @@ function buildAnthropicTextResponse(text, externalModel, usage = {}) {
 
 function buildPersistedAssistantMessage(response) {
   const content = Array.isArray(response?.content) ? response.content : [];
-  const textBlocks = content.filter(block => block?.type === "text" && typeof block.text === "string");
-  if (textBlocks.length > 0) {
+  const persistedBlocks = content.filter(block => {
+    if (block?.type === "text" && typeof block.text === "string") {
+      return true;
+    }
+    if (block?.type === "thinking" && typeof block.thinking === "string") {
+      return true;
+    }
+    return false;
+  });
+  if (persistedBlocks.length > 0) {
     return {
       role: "assistant",
-      content: textBlocks,
+      content: persistedBlocks,
     };
   }
 
@@ -1016,12 +1097,16 @@ function createCodexTurnAccumulator({ onEvent } = {}) {
       return {
         id: null,
         summary: [],
+        text: "",
+        content: [],
       };
     }
     if (!reasoningMessages.has(itemId)) {
       reasoningMessages.set(itemId, {
         id: itemId,
         summary: [],
+        text: "",
+        content: [],
       });
       pushOrder(reasoningOrder, itemId);
     }
@@ -1107,6 +1192,18 @@ function createCodexTurnAccumulator({ onEvent } = {}) {
         delta,
       });
     },
+    noteReasoningTextDelta({ itemId, delta }) {
+      if (!itemId || !delta) {
+        return;
+      }
+      const entry = ensureReasoningMessage(itemId);
+      entry.text += delta;
+      emit({
+        type: "reasoning_text_delta",
+        itemId,
+        delta,
+      });
+    },
     noteCompletedItem(item) {
       if (!item || typeof item !== "object") {
         return;
@@ -1138,6 +1235,12 @@ function createCodexTurnAccumulator({ onEvent } = {}) {
           if (Array.isArray(item.summary)) {
             entry.summary = [...item.summary];
           }
+          if (typeof item.text === "string" && item.text.trim()) {
+            entry.text = item.text;
+          }
+          if (Array.isArray(item.content)) {
+            entry.content = cloneSerializable(item.content);
+          }
           break;
         }
         default:
@@ -1159,6 +1262,16 @@ function createCodexTurnAccumulator({ onEvent } = {}) {
         finalMessage: finalMessage || lastAgentMessage || lastPlanMessage || "",
         lastAgentMessage,
         lastPlanMessage,
+        reasoningTexts: reasoningOrder.flatMap(itemId => {
+          const entry = reasoningMessages.get(itemId);
+          return buildReasoningDisplayTexts({
+            reasoningTexts: [
+              typeof entry?.text === "string" ? entry.text : "",
+              ...extractReasoningTextsFromValue(entry?.content),
+            ],
+            reasoningSummaries: [],
+          });
+        }),
         reasoningSummaries: reasoningOrder.flatMap(itemId => {
           const entry = reasoningMessages.get(itemId);
           return Array.isArray(entry?.summary) ? entry.summary.filter(Boolean) : [];
@@ -1260,6 +1373,12 @@ async function runCodexTurn({
               accumulator.noteReasoningSummaryDelta({
                 itemId: message.params?.itemId,
                 summaryIndex: message.params?.summaryIndex ?? 0,
+                delta: message.params?.delta || "",
+              });
+              break;
+            case "item/reasoning/textDelta":
+              accumulator.noteReasoningTextDelta({
+                itemId: message.params?.itemId,
                 delta: message.params?.delta || "",
               });
               break;
@@ -1365,7 +1484,6 @@ export async function createAppServerCodexTurnController({
             optOutNotificationMethods: [
               "command/exec/outputDelta",
               "item/fileChange/outputDelta",
-              "item/reasoning/textDelta",
             ],
           }
         : undefined,
@@ -1485,6 +1603,12 @@ export async function createAppServerCodexTurnController({
             accumulator.noteReasoningSummaryDelta({
               itemId: message.params?.itemId,
               summaryIndex: message.params?.summaryIndex ?? 0,
+              delta: message.params?.delta || "",
+            });
+            break;
+          case "item/reasoning/textDelta":
+            accumulator.noteReasoningTextDelta({
+              itemId: message.params?.itemId,
               delta: message.params?.delta || "",
             });
             break;
@@ -1887,6 +2011,7 @@ function createAnthropicStreamWriter(res, externalModel) {
 function createCodexStreamBridge({ res, externalModel, includeThinking }) {
   const writer = createAnthropicStreamWriter(res, externalModel);
   const emittedBlocks = new Set();
+  const reasoningModes = new Map();
   let emittedContent = false;
 
   function appendVisibleText(kind, itemId, text) {
@@ -1899,14 +2024,24 @@ function createCodexStreamBridge({ res, externalModel, includeThinking }) {
     writer.appendText(key, text);
   }
 
-  function appendThinkingText(itemId, summaryIndex, text) {
+  function appendThinkingText(key, text) {
     if (!includeThinking || !text) {
       return;
     }
-    const key = `reasoning:${itemId}:${summaryIndex}`;
     emittedContent = true;
     emittedBlocks.add(key);
     writer.appendThinking(key, text);
+  }
+
+  function reasoningModeForItem(itemId) {
+    return reasoningModes.get(itemId) || null;
+  }
+
+  function setReasoningMode(itemId, mode) {
+    if (!itemId || !mode) {
+      return;
+    }
+    reasoningModes.set(itemId, mode);
   }
 
   return {
@@ -1918,8 +2053,16 @@ function createCodexStreamBridge({ res, externalModel, includeThinking }) {
         case "agent_message_delta":
           appendVisibleText("agent", event.itemId, event.delta);
           break;
+        case "reasoning_text_delta":
+          setReasoningMode(event.itemId, "raw");
+          appendThinkingText(`reasoning:${event.itemId}:raw`, event.delta);
+          break;
         case "reasoning_summary_delta":
-          appendThinkingText(event.itemId, event.summaryIndex, event.delta);
+          if (reasoningModeForItem(event.itemId) === "raw") {
+            break;
+          }
+          setReasoningMode(event.itemId, "summary");
+          appendThinkingText(`reasoning:${event.itemId}:summary:${event.summaryIndex}`, event.delta);
           break;
         case "item_completed":
           if (event.item?.type === "plan") {
@@ -1935,26 +2078,45 @@ function createCodexStreamBridge({ res, externalModel, includeThinking }) {
             }
             writer.stopBlock(key);
           } else if (includeThinking && event.item?.type === "reasoning") {
-            const summaryParts = Array.isArray(event.item.summary) ? event.item.summary : [];
-            summaryParts.forEach((summaryText, summaryIndex) => {
-              const key = `reasoning:${event.item.id}:${summaryIndex}`;
-              if (!emittedBlocks.has(key) && summaryText) {
-                appendThinkingText(event.item.id, summaryIndex, summaryText);
+            const itemId = event.item.id;
+            const rawThinkingTexts = buildReasoningDisplayTexts({
+              reasoningTexts: [
+                typeof event.item.text === "string" ? event.item.text : "",
+                ...extractReasoningTextsFromValue(event.item.content),
+              ],
+              reasoningSummaries: [],
+            });
+            const summaryThinkingTexts = normalizeReasoningTextList(event.item.summary);
+            const mode =
+              reasoningModeForItem(itemId) || (rawThinkingTexts.length > 0 ? "raw" : summaryThinkingTexts.length > 0 ? "summary" : null);
+
+            if (mode === "raw") {
+              const key = `reasoning:${itemId}:raw`;
+              if (!emittedBlocks.has(key)) {
+                rawThinkingTexts.forEach(text => appendThinkingText(key, text));
               }
               writer.stopBlock(key);
-            });
+            } else if (mode === "summary") {
+              summaryThinkingTexts.forEach((summaryText, summaryIndex) => {
+                const key = `reasoning:${itemId}:summary:${summaryIndex}`;
+                if (!emittedBlocks.has(key) && summaryText) {
+                  appendThinkingText(key, summaryText);
+                }
+                writer.stopBlock(key);
+              });
+            }
           }
           break;
         default:
           break;
       }
     },
-    emitFallback({ text, reasoningSummaries = [] } = {}) {
+    emitFallback({ text, reasoningTexts = [], reasoningSummaries = [] } = {}) {
       if (emittedContent) {
         return;
       }
-      reasoningSummaries.forEach((summary, index) => {
-        appendThinkingText("fallback", index, summary);
+      buildReasoningDisplayTexts({ reasoningTexts, reasoningSummaries }).forEach(thinking => {
+        appendThinkingText("reasoning:fallback", thinking);
       });
       if (text) {
         appendVisibleText("agent", "fallback", text);
@@ -2011,9 +2173,18 @@ function ensureCompletedCodexControllerOutcome(outcome) {
 
 function buildCodexCompletionArtifacts({ body, externalModel, result }) {
   const normalizedText = normalizeStructuredOutputText(result.finalMessage, body?.output_config?.format);
+  const thinkingTexts = isThinkingEnabled(body)
+    ? buildReasoningDisplayTexts({
+        reasoningTexts: result.reasoningTexts,
+        reasoningSummaries: result.reasoningSummaries,
+      })
+    : [];
   return {
     normalizedText,
-    response: buildAnthropicTextResponse(normalizedText, externalModel, result.usage),
+    response: buildAnthropicTextResponse(normalizedText, externalModel, result.usage, {
+      thinkingTexts,
+    }),
+    thinkingTexts,
   };
 }
 
@@ -2390,6 +2561,7 @@ export function createCodexBackend({
 
           pendingStreamBridge.emitFallback({
             text: completion.normalizedText,
+            reasoningTexts: thinkingEnabled ? outcome.result.reasoningTexts : [],
             reasoningSummaries: thinkingEnabled ? outcome.result.reasoningSummaries : [],
           });
           pendingStreamBridge.finish(outcome.result.usage);
@@ -2461,6 +2633,7 @@ export function createCodexBackend({
 
           streamBridge.emitFallback({
             text: completion.normalizedText,
+            reasoningTexts: thinkingEnabled ? outcome.result.reasoningTexts : [],
             reasoningSummaries: thinkingEnabled ? outcome.result.reasoningSummaries : [],
           });
           streamBridge.finish(outcome.result.usage);
@@ -2504,6 +2677,7 @@ export function createCodexBackend({
 
         streamBridge.emitFallback({
           text: completion.normalizedText,
+          reasoningTexts: thinkingEnabled ? result.reasoningTexts : [],
           reasoningSummaries: thinkingEnabled ? result.reasoningSummaries : [],
         });
         streamBridge.finish(result.usage);

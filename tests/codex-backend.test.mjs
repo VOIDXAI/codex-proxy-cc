@@ -1539,6 +1539,14 @@ test("codex backend sends the latest Claude user turn as structured Codex input 
             },
           },
           {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: "image/png",
+              data: "aGVsbG8=",
+            },
+          },
+          {
             type: "document",
             source: {
               type: "text",
@@ -1564,6 +1572,10 @@ test("codex backend sends the latest Claude user turn as structured Codex input 
       url: "https://example.com/diagram.png",
     },
     {
+      type: "image",
+      url: "data:image/png;base64,aGVsbG8=",
+    },
+    {
       type: "text",
       text: "Attached document:\nArchitecture notes",
       text_elements: [],
@@ -1573,23 +1585,64 @@ test("codex backend sends the latest Claude user turn as structured Codex input 
   assert.match(calls[0].prompt, /What should I inspect\?/);
 });
 
-test("codex backend streams plan and reasoning summaries when thinking is requested", async () => {
+test("codex backend returns raw thinking blocks in non-stream responses when reasoning text is available", async () => {
+  const backend = createCodexBackend({
+    config: DEFAULT_CONFIG,
+    logger: null,
+    async runTurn(input) {
+      return {
+        threadId: "thread_thinking",
+        threadPath: "/tmp/thread-thinking.json",
+        model: input.model,
+        finalMessage: "Implemented.",
+        reasoningTexts: ["Inspect the repo first."],
+        reasoningSummaries: ["High-level summary."],
+        usage: {
+          input_tokens: 8,
+          output_tokens: 3,
+        },
+      };
+    },
+  });
+
+  const response = await backend.createMessage({
+    model: "sonnet",
+    thinking: {
+      type: "enabled",
+      budget_tokens: 1024,
+    },
+    messages: [{ role: "user", content: "Plan this change." }],
+  });
+
+  assert.deepEqual(response.content, [
+    {
+      type: "thinking",
+      thinking: "Inspect the repo first.",
+    },
+    {
+      type: "text",
+      text: "Implemented.",
+    },
+  ]);
+});
+
+test("codex backend streams plan and raw reasoning text when thinking is requested", async () => {
   const backend = createCodexBackend({
     config: DEFAULT_CONFIG,
     logger: null,
     async runTurn(input) {
       input.onEvent?.({
-        type: "reasoning_summary_delta",
+        type: "reasoning_text_delta",
         itemId: "reason_1",
-        summaryIndex: 0,
-        delta: "Map the work.",
+        delta: "Inspect the repo carefully.",
       });
       input.onEvent?.({
         type: "item_completed",
         item: {
           type: "reasoning",
           id: "reason_1",
-          summary: ["Map the work."],
+          content: [{ text: "Inspect the repo carefully." }],
+          summary: ["High-level summary."],
         },
       });
       input.onEvent?.({
@@ -1624,7 +1677,8 @@ test("codex backend streams plan and reasoning summaries when thinking is reques
         threadPath: "/tmp/thread-live.json",
         model: input.model,
         finalMessage: "Implemented.",
-        reasoningSummaries: ["Map the work."],
+        reasoningTexts: ["Inspect the repo carefully."],
+        reasoningSummaries: ["High-level summary."],
         usage: {
           input_tokens: 8,
           output_tokens: 3,
@@ -1670,7 +1724,7 @@ test("codex backend streams plan and reasoning summaries when thinking is reques
   const messageDelta = events.find(event => event.event === "message_delta");
 
   assert.ok(thinkingStart);
-  assert.equal(thinkingDelta.data.delta.thinking, "Map the work.");
+  assert.equal(thinkingDelta.data.delta.thinking, "Inspect the repo carefully.");
   assert.equal(textStarts.length, 2);
   assert.deepEqual(
     textDeltas.map(event => event.data.delta.text),
