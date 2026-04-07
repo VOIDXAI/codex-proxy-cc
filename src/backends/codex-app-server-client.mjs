@@ -2,6 +2,7 @@ import readline from "node:readline";
 import { spawn, spawnSync } from "node:child_process";
 
 import { AppError } from "../shared/errors.mjs";
+import { resolveBinaryOnPath } from "../shared/resolve-binary.mjs";
 
 const DEFAULT_CLIENT_INFO = {
   name: "codex-proxy-cc",
@@ -34,19 +35,12 @@ function createProtocolError(message, data) {
   return error;
 }
 
-export function findCodexBinary(binaryName) {
+export function findCodexBinary(binaryName, env = process.env) {
   if (!binaryName) {
     throw new AppError("Codex binary is not configured");
   }
 
-  if (binaryName.includes("/")) {
-    return binaryName;
-  }
-
-  const result = spawnSync("sh", ["-lc", `command -v ${JSON.stringify(binaryName)}`], {
-    encoding: "utf8",
-  });
-  const resolved = result.stdout?.trim();
+  const resolved = resolveBinaryOnPath(binaryName, { env });
   if (!resolved) {
     throw new AppError(`Could not find Codex binary '${binaryName}' on PATH`, {
       status: 500,
@@ -56,11 +50,12 @@ export function findCodexBinary(binaryName) {
   return resolved;
 }
 
-export function getCodexLoginStatus(binaryName, cwd = process.cwd()) {
-  const binary = findCodexBinary(binaryName);
+export function getCodexLoginStatus(binaryName, cwd = process.cwd(), env = process.env) {
+  const binary = findCodexBinary(binaryName, env);
   const result = spawnSync(binary, ["login", "status"], {
     cwd,
     encoding: "utf8",
+    env,
   });
 
   return {
@@ -103,7 +98,7 @@ export class SpawnedCodexAppServerClient {
   }
 
   async initialize() {
-    const binary = findCodexBinary(this.options.command || "codex");
+    const binary = findCodexBinary(this.options.command || "codex", this.options.env);
     this.proc = spawn(binary, ["app-server"], {
       cwd: this.cwd,
       env: this.options.env,

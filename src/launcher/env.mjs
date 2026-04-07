@@ -1,8 +1,8 @@
-import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 
 import { resolveModelConfig } from "../adapters/model-mapping.mjs";
 import { AppError } from "../shared/errors.mjs";
+import { resolveBinaryOnPath } from "../shared/resolve-binary.mjs";
 
 export function parseClaudeLaunchHints(args = []) {
   const hints = {};
@@ -98,20 +98,12 @@ export function generateLocalGatewayToken() {
   return crypto.randomBytes(24).toString("hex");
 }
 
-export function findClaudeBinary(binaryName) {
+export function findClaudeBinary(binaryName, env = process.env) {
   if (!binaryName) {
     throw new AppError("Claude binary is not configured");
   }
 
-  if (binaryName.includes("/")) {
-    return binaryName;
-  }
-
-  const result = spawnSync("sh", ["-lc", `command -v ${JSON.stringify(binaryName)}`], {
-    encoding: "utf8",
-  });
-
-  const resolved = result.stdout?.trim();
+  const resolved = resolveBinaryOnPath(binaryName, { env });
   if (!resolved) {
     throw new AppError(`Could not find Claude binary '${binaryName}' on PATH`, {
       status: 500,

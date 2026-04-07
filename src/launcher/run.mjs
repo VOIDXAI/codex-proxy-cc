@@ -10,7 +10,7 @@ export async function launchClaude({
   gateway,
   logger,
 }) {
-  const resolvedBinary = findClaudeBinary(binary);
+  const resolvedBinary = findClaudeBinary(binary, env);
 
   logger.info("Launching Claude Code", {
     binary: resolvedBinary,

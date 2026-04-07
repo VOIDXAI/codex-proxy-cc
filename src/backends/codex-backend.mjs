@@ -2692,5 +2692,5 @@ export function createCodexBackend({
 }
 
 export function getCodexBackendStatus(config) {
-  return getCodexLoginStatus(config.codex.binary, process.cwd());
+  return getCodexLoginStatus(config.codex.binary, process.cwd(), process.env);
 }
