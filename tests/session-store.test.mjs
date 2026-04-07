@@ -38,9 +38,10 @@ test("file session store isolates keyed conversations within the same cwd", asyn
   });
   const latestConversation = await store.loadRecentConversation({ cwd });
 
-  assert.equal(alphaConversation.messages[0].content, "remember alpha");
-  assert.equal(betaConversation.messages[0].content, "remember beta");
-  assert.equal(latestConversation.messages[0].content, "remember beta");
+  assert.deepEqual(alphaConversation.messageFingerprints, [JSON.stringify({ role: "user", content: "remember alpha" })]);
+  assert.deepEqual(betaConversation.messageFingerprints, [JSON.stringify({ role: "user", content: "remember beta" })]);
+  assert.deepEqual(latestConversation.messageFingerprints, [JSON.stringify({ role: "user", content: "remember beta" })]);
+  assert.equal(latestConversation.messageCount, 1);
 });
 
 test("file session store persists transport metadata for codex thread reuse", async () => {
@@ -69,5 +70,9 @@ test("file session store persists transport metadata for codex thread reuse", as
   assert.equal(entry.metadata.threadId, "thread_123");
   assert.equal(entry.metadata.threadPath, "/tmp/thread-123.json");
   assert.equal(entry.metadata.model, "gpt-5.4");
+  assert.deepEqual(entry.messageFingerprints, [
+    JSON.stringify({ role: "user", content: "remember thread metadata" }),
+  ]);
+  assert.equal(entry.messageCount, 1);
   assert.match(entry.workspaceId, /^[a-f0-9]{40}$/);
 });

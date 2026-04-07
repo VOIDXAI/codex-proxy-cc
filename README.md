@@ -29,6 +29,7 @@ Working today:
 - streaming text responses
 - `/plan` text streaming and reasoning summary streaming
 - structured JSON output through Claude-style `output_config`
+- structured latest-turn forwarding for Claude text and image inputs
 - Claude Code-owned `-c` / `--resume` flows
 
 Not a goal:
@@ -225,7 +226,8 @@ Environment overrides:
 
 - the runtime is tuned for Claude Code `v2.1.88` behavior first
 - the proxy does not try to be a full general-purpose Anthropic replacement
-- Codex still receives a reconstructed Claude transcript for sampling; this is lightweight, but not byte-for-byte Anthropic wire parity
+- earlier Claude transcript history is still reconstructed for sampling, although the latest user turn is forwarded as structured Codex input items when possible
+- transport continuity still keeps a tiny local cache for Codex thread reuse, but it now stores message fingerprints and thread metadata rather than full conversation snapshots
 
 ## Development
 

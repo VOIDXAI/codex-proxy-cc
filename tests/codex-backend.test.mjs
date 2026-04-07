@@ -241,7 +241,7 @@ test("app-server turn controller queues concurrent tool calls instead of overwri
   await controller.close();
 });
 
-test("codex backend preserves tool_use and tool_result history in its prompt transcript", async () => {
+test("codex backend preserves prior tool history in the prompt and latest tool results in turn input", async () => {
   const calls = [];
   const backend = createCodexBackend({
     config: DEFAULT_CONFIG,
@@ -292,7 +292,8 @@ test("codex backend preserves tool_use and tool_result history in its prompt tra
   assert.equal(response.content[0].text, "tool-history-ok");
   assert.match(calls[0].prompt, /Frontend tool request: read_file/);
   assert.match(calls[0].prompt, /tool_use_id: tool_123/);
-  assert.match(calls[0].prompt, /Frontend tool result for tool_123/);
+  assert.equal(calls[0].turnInput[1].type, "text");
+  assert.match(calls[0].turnInput[1].text, /Frontend tool result for tool_123/);
 });
 
 test("codex backend bridges native Anthropic tools through Codex dynamic tool calls", async () => {
@@ -961,7 +962,8 @@ test("codex backend ignores unknown Anthropic content blocks and logs a warning"
   });
 
   assert.equal(response.content[0].text, "ignored-unknown-block");
-  assert.match(calls[0].prompt, /Keep this text\./);
+  assert.equal(calls[0].turnInput[1].type, "text");
+  assert.equal(calls[0].turnInput[1].text, "Keep this text.");
   assert.doesNotMatch(calls[0].prompt, /audio\.mp3/);
   assert.equal(warnings.length, 1);
   assert.equal(warnings[0].message, "Ignoring unsupported Anthropic content block");
@@ -1096,7 +1098,7 @@ test("codex backend forwards output schema to the Codex runtime", async () => {
   });
 });
 
-test("codex backend prompt tells the agent to use StructuredOutput when JSON is required", async () => {
+test("codex backend prompt requires direct JSON-only output when JSON is required", async () => {
   const calls = [];
   const backend = createCodexBackend({
     config: DEFAULT_CONFIG,
@@ -1133,7 +1135,7 @@ test("codex backend prompt tells the agent to use StructuredOutput when JSON is 
   });
 
   assert.match(calls[0].prompt, /Return the final response directly\./);
-  assert.match(calls[0].prompt, /You must use the StructuredOutput tool for the final response\./);
+  assert.match(calls[0].prompt, /The frontend expects valid JSON only\./);
   assert.match(calls[0].prompt, /Your entire response must be a single valid JSON object\./);
   assert.match(calls[0].prompt, /Do not include markdown fences, explanations, prefixes, or suffixes\./);
 });
@@ -1219,7 +1221,7 @@ test("codex backend omits stop-hook structured-output retries from the replayed 
   );
 });
 
-test("codex backend returns StructuredOutput tool_use blocks when JSON schema output is requested", async () => {
+test("codex backend returns normalized JSON text when JSON schema output is requested", async () => {
   const backend = createCodexBackend({
     config: DEFAULT_CONFIG,
     logger: null,
@@ -1237,21 +1239,6 @@ test("codex backend returns StructuredOutput tool_use blocks when JSON schema ou
   const response = await backend.createMessage({
     model: "sonnet",
     messages: [{ role: "user", content: "Return JSON." }],
-    tools: [
-      {
-        name: "StructuredOutput",
-        description: "Return structured output in the requested format",
-        input_schema: {
-          type: "object",
-          properties: {
-            answer: { type: "string" },
-            count: { type: "integer" },
-          },
-          required: ["answer", "count"],
-          additionalProperties: false,
-        },
-      },
-    ],
     output_config: {
       format: {
         type: "json_schema",
@@ -1268,21 +1255,16 @@ test("codex backend returns StructuredOutput tool_use blocks when JSON schema ou
     },
   });
 
-  assert.equal(response.stop_reason, "tool_use");
+  assert.equal(response.stop_reason, "end_turn");
   assert.deepEqual(response.content, [
     {
-      type: "tool_use",
-      id: response.content[0].id,
-      name: "StructuredOutput",
-      input: {
-        answer: "ok",
-        count: 7,
-      },
+      type: "text",
+      text: '{"answer":"ok","count":7}',
     },
   ]);
 });
 
-test("codex backend finalizes StructuredOutput follow-up turns without another Codex request", async () => {
+test("codex backend no longer short-circuits StructuredOutput follow-up turns", async () => {
   const calls = [];
   const backend = createCodexBackend({
     config: DEFAULT_CONFIG,
@@ -1290,7 +1272,7 @@ test("codex backend finalizes StructuredOutput follow-up turns without another C
     async runTurn(input) {
       calls.push(input);
       return {
-        finalMessage: "should-not-run",
+        finalMessage: '{"answer":"ok","count":7}',
         usage: {
           input_tokens: 1,
           output_tokens: 1,
@@ -1329,12 +1311,17 @@ test("codex backend finalizes StructuredOutput follow-up turns without another C
     ],
   });
 
-  assert.equal(calls.length, 0);
+  assert.equal(calls.length, 1);
   assert.equal(response.stop_reason, "end_turn");
-  assert.deepEqual(response.content, []);
+  assert.deepEqual(response.content, [
+    {
+      type: "text",
+      text: '{"answer":"ok","count":7}',
+    },
+  ]);
 });
 
-test("codex backend streams StructuredOutput tool_use blocks for JSON schema output", async () => {
+test("codex backend streams normalized JSON text for JSON schema output", async () => {
   const backend = createCodexBackend({
     config: DEFAULT_CONFIG,
     logger: null,
@@ -1355,21 +1342,6 @@ test("codex backend streams StructuredOutput tool_use blocks for JSON schema out
       model: "sonnet",
       stream: true,
       messages: [{ role: "user", content: "Return JSON." }],
-      tools: [
-        {
-          name: "StructuredOutput",
-          description: "Return structured output in the requested format",
-          input_schema: {
-            type: "object",
-            properties: {
-              answer: { type: "string" },
-              count: { type: "integer" },
-            },
-            required: ["answer", "count"],
-            additionalProperties: false,
-          },
-        },
-      ],
       output_config: {
         format: {
           type: "json_schema",
@@ -1407,11 +1379,10 @@ test("codex backend streams StructuredOutput tool_use blocks for JSON schema out
       "message_stop",
     ],
   );
-  assert.equal(events[1].data.content_block.type, "tool_use");
-  assert.equal(events[1].data.content_block.name, "StructuredOutput");
-  assert.equal(events[2].data.delta.type, "input_json_delta");
-  assert.equal(events[2].data.delta.partial_json, '{"answer":"ok","count":7}');
-  assert.equal(events[4].data.delta.stop_reason, "tool_use");
+  assert.equal(events[1].data.content_block.type, "text");
+  assert.equal(events[2].data.delta.type, "text_delta");
+  assert.equal(events[2].data.delta.text, '{"answer":"ok","count":7}');
+  assert.equal(events[4].data.delta.stop_reason, "end_turn");
 });
 
 test("codex backend saves recent conversation snapshots for streamed replies", async () => {
@@ -1476,12 +1447,12 @@ test("codex backend reuses stored codex threads and only prompts with incrementa
     sessionStore: {
       async loadRecentConversation() {
         return {
-          messages: [
-            { role: "user", content: "Remember alpha." },
-            {
+          messageFingerprints: [
+            JSON.stringify({ role: "user", content: "Remember alpha." }),
+            JSON.stringify({
               role: "assistant",
               content: [{ type: "text", text: "I will remember alpha." }],
-            },
+            }),
           ],
           metadata: {
             backend: "codex-app-server",
@@ -1527,8 +1498,79 @@ test("codex backend reuses stored codex threads and only prompts with incrementa
   assert.equal(response.content[0].text, "alpha remembered");
   assert.equal(calls[0].threadContext.threadId, "thread_prev");
   assert.equal(calls[0].threadContext.threadPath, "/tmp/thread-prev.json");
-  assert.match(calls[0].prompt, /What should you remember\?/);
   assert.doesNotMatch(calls[0].prompt, /Remember alpha\./);
+  assert.equal(calls[0].turnInput[1].type, "text");
+  assert.equal(calls[0].turnInput[1].text, "What should you remember?");
+});
+
+test("codex backend sends the latest Claude user turn as structured Codex input items", async () => {
+  const calls = [];
+  const backend = createCodexBackend({
+    config: DEFAULT_CONFIG,
+    logger: null,
+    async runTurn(input) {
+      calls.push(input);
+      return {
+        finalMessage: "structured-input-ok",
+        usage: {
+          input_tokens: 10,
+          output_tokens: 2,
+        },
+      };
+    },
+  });
+
+  const response = await backend.createMessage({
+    model: "sonnet",
+    messages: [
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "What should I inspect?" }],
+      },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Inspect these inputs." },
+          {
+            type: "image",
+            source: {
+              type: "url",
+              url: "https://example.com/diagram.png",
+            },
+          },
+          {
+            type: "document",
+            source: {
+              type: "text",
+              data: "Architecture notes",
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.equal(response.content[0].text, "structured-input-ok");
+  assert.equal(calls[0].turnInput[0].type, "text");
+  assert.match(calls[0].turnInput[0].text, /The latest user turn is attached as structured turn input items/);
+  assert.deepEqual(calls[0].turnInput.slice(1), [
+    {
+      type: "text",
+      text: "Inspect these inputs.",
+      text_elements: [],
+    },
+    {
+      type: "image",
+      url: "https://example.com/diagram.png",
+    },
+    {
+      type: "text",
+      text: "Attached document:\nArchitecture notes",
+      text_elements: [],
+    },
+  ]);
+  assert.doesNotMatch(calls[0].prompt, /Inspect these inputs\./);
+  assert.match(calls[0].prompt, /What should I inspect\?/);
 });
 
 test("codex backend streams plan and reasoning summaries when thinking is requested", async () => {

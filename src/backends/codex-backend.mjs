@@ -5,7 +5,6 @@ import { openSse, startPing, writeSseEvent } from "../gateway/sse.mjs";
 import { connectCodexAppServer, getCodexLoginStatus } from "./codex-app-server-client.mjs";
 import { resolveModelConfig } from "../adapters/model-mapping.mjs";
 
-const SYNTHETIC_OUTPUT_TOOL_NAME = "StructuredOutput";
 const RESERVED_DYNAMIC_TOOL_NAME_PREFIXES = ["mcp__"];
 const SAFE_DYNAMIC_TOOL_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,127}$/u;
 
@@ -210,7 +209,6 @@ function buildStructuredOutputInstructions(format) {
     return [
       directInstruction,
       "The frontend expects valid JSON only.",
-      "You must use the StructuredOutput tool for the final response.",
       "Your entire response must be a single valid JSON object.",
       "Do not include markdown fences, explanations, prefixes, or suffixes.",
     ].join("\n");
@@ -226,7 +224,6 @@ function buildStructuredOutputInstructions(format) {
     return [
       directInstruction,
       "The frontend expects valid JSON only.",
-      "You must use the StructuredOutput tool for the final response.",
       "Your entire response must be a single valid JSON object.",
       "Do not include markdown fences, explanations, prefixes, or suffixes.",
       "If you are unsure, output the simplest object that satisfies the schema exactly.",
@@ -367,84 +364,95 @@ function isPlainTextContentBlock(block) {
   return block?.type === "text" && typeof block.text === "string";
 }
 
-function findStructuredOutputToolUseBlock(message) {
-  const content = normalizeMessageContent(message?.content);
-  return (
-    content.find(
-      block => block?.type === "tool_use" && block?.name === SYNTHETIC_OUTPUT_TOOL_NAME && block.input,
-    ) || null
-  );
+function buildCodexTurnTextInputItem(text) {
+  if (typeof text !== "string" || text.trim() === "") {
+    return null;
+  }
+  return {
+    type: "text",
+    text,
+    text_elements: [],
+  };
 }
 
-function canonicalizeAssistantSessionMessage(message) {
-  if (message?.role !== "assistant") {
-    return message;
+function buildCodexTurnInputItemsFromBlock(block, { logger } = {}) {
+  if (!block) {
+    return [];
+  }
+  if (typeof block === "string") {
+    const item = buildCodexTurnTextInputItem(block);
+    return item ? [item] : [];
   }
 
-  const content = normalizeMessageContent(message.content);
-  const textBlocks = content.filter(isPlainTextContentBlock);
-  if (textBlocks.length > 0) {
+  switch (block.type) {
+    case "text": {
+      const item = buildCodexTurnTextInputItem(block.text || "");
+      return item ? [item] : [];
+    }
+    case "image":
+      if (block.source?.type === "url" && block.source.url) {
+        return [
+          {
+            type: "image",
+            url: block.source.url,
+          },
+        ];
+      }
+      break;
+    case "document":
+    case "tool_reference":
+    case "server_tool_use":
+    case "mcp_tool_use":
+    case "tool_use":
+    case "tool_result":
+    case "connector_text": {
+      const item = buildCodexTurnTextInputItem(describeBlock(block, { logger }));
+      return item ? [item] : [];
+    }
+    default:
+      break;
+  }
+
+  const fallbackItem = buildCodexTurnTextInputItem(describeBlock(block, { logger }));
+  return fallbackItem ? [fallbackItem] : [];
+}
+
+function splitLatestStructuredUserTurn(messages = [], { logger } = {}) {
+  const normalizedMessages = Array.isArray(messages) ? messages : [];
+  if (normalizedMessages.length === 0) {
     return {
-      role: "assistant",
-      content: textBlocks,
+      historyMessages: normalizedMessages,
+      latestTurnInput: [],
     };
   }
 
-  const structuredOutputBlock = findStructuredOutputToolUseBlock(message);
-  if (structuredOutputBlock) {
+  const lastMessage = normalizedMessages[normalizedMessages.length - 1];
+  if (lastMessage?.role !== "user") {
     return {
-      role: "assistant",
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(structuredOutputBlock.input),
-        },
-      ],
+      historyMessages: normalizedMessages,
+      latestTurnInput: [],
     };
   }
 
-  return message;
-}
-
-function isStructuredOutputToolResultMessage(message, expectedToolUseId) {
-  if (message?.role !== "user") {
-    return false;
+  const latestTurnInput = normalizeMessageContent(lastMessage.content).flatMap(block =>
+    buildCodexTurnInputItemsFromBlock(block, { logger }),
+  );
+  if (latestTurnInput.length === 0) {
+    return {
+      historyMessages: normalizedMessages,
+      latestTurnInput: [],
+    };
   }
 
-  const blocks = normalizeMessageContent(message.content);
-  return (
-    blocks.length > 0 &&
-    blocks.every(block => isSuccessfulToolResultBlock(block, expectedToolUseId))
-  );
+  return {
+    historyMessages: normalizedMessages.slice(0, -1),
+    latestTurnInput,
+  };
 }
 
 function canonicalizeMessagesForSession(messages = []) {
   const normalizedMessages = Array.isArray(messages) ? messages : [];
-  const canonical = [];
-  let pendingStructuredOutputToolUseId = null;
-
-  for (const message of normalizedMessages) {
-    if (!message || typeof message !== "object") {
-      continue;
-    }
-
-    if (
-      pendingStructuredOutputToolUseId &&
-      isStructuredOutputToolResultMessage(message, pendingStructuredOutputToolUseId)
-    ) {
-      pendingStructuredOutputToolUseId = null;
-      continue;
-    }
-
-    const canonicalMessage = canonicalizeAssistantSessionMessage(message);
-    canonical.push(canonicalMessage);
-
-    const structuredOutputBlock =
-      message?.role === "assistant" ? findStructuredOutputToolUseBlock(message) : null;
-    pendingStructuredOutputToolUseId = structuredOutputBlock?.id || null;
-  }
-
-  return canonical;
+  return normalizedMessages.filter(message => message && typeof message === "object");
 }
 
 function cloneSerializable(value) {
@@ -453,28 +461,6 @@ function cloneSerializable(value) {
 
 function messageFingerprints(messages = []) {
   return messages.map(message => JSON.stringify(message));
-}
-
-function splitIncrementalMessages(currentMessages = [], previousMessages = []) {
-  if (!Array.isArray(currentMessages) || currentMessages.length === 0) {
-    return null;
-  }
-  if (!Array.isArray(previousMessages) || previousMessages.length === 0) {
-    return null;
-  }
-  if (previousMessages.length >= currentMessages.length) {
-    return null;
-  }
-
-  const currentFingerprints = messageFingerprints(currentMessages);
-  const previousFingerprints = messageFingerprints(previousMessages);
-  for (let index = 0; index < previousFingerprints.length; index += 1) {
-    if (currentFingerprints[index] !== previousFingerprints[index]) {
-      return null;
-    }
-  }
-
-  return currentMessages.slice(previousMessages.length);
 }
 
 function isThinkingEnabled(body) {
@@ -506,7 +492,7 @@ function pendingToolSessionKey(body) {
 }
 
 function filterNativeAnthropicTools(tools = []) {
-  return tools.filter(tool => tool?.name && tool.name !== SYNTHETIC_OUTPUT_TOOL_NAME);
+  return tools.filter(tool => tool?.name);
 }
 
 function isReservedDynamicToolName(name) {
@@ -641,67 +627,6 @@ function buildAnthropicToolUseResponse(toolName, input, externalModel, usage = {
   };
 }
 
-function buildAnthropicEmptyResponse(externalModel, usage = {}) {
-  return {
-    id: `msg_${crypto.randomUUID()}`,
-    type: "message",
-    role: "assistant",
-    model: externalModel,
-    content: [],
-    stop_reason: "end_turn",
-    stop_sequence: null,
-    usage: {
-      input_tokens: usage.input_tokens ?? 0,
-      output_tokens: usage.output_tokens ?? 0,
-    },
-  };
-}
-
-function findToolByName(tools = [], name) {
-  return tools.find(tool => tool?.name === name) || null;
-}
-
-function findLastToolUseId(messages = [], toolName) {
-  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
-    const message = messages[messageIndex];
-    const content = normalizeMessageContent(message?.content);
-    for (let blockIndex = content.length - 1; blockIndex >= 0; blockIndex -= 1) {
-      const block = content[blockIndex];
-      if (block?.type === "tool_use" && block?.name === toolName && typeof block.id === "string") {
-        return block.id;
-      }
-    }
-  }
-  return null;
-}
-
-function isSuccessfulToolResultBlock(block, expectedToolUseId) {
-  return (
-    block?.type === "tool_result" &&
-    block.tool_use_id === expectedToolUseId &&
-    block.is_error !== true
-  );
-}
-
-function shouldFinalizeStructuredOutputTurn(messages = []) {
-  const toolUseId = findLastToolUseId(messages, SYNTHETIC_OUTPUT_TOOL_NAME);
-  if (!toolUseId || messages.length === 0) {
-    return false;
-  }
-
-  const lastMessage = messages[messages.length - 1];
-  if (lastMessage?.role !== "user") {
-    return false;
-  }
-
-  const blocks = normalizeMessageContent(lastMessage.content);
-  if (blocks.length === 0) {
-    return false;
-  }
-
-  return blocks.every(block => isSuccessfulToolResultBlock(block, toolUseId));
-}
-
 function buildToolResultContentItems(content) {
   if (typeof content === "string") {
     return [{ type: "inputText", text: content }];
@@ -780,7 +705,10 @@ function buildCodexPromptFromAnthropic(body, config, options = {}) {
     options.resolvedModel || resolveModelConfig(config, body.model, body?.output_config?.effort);
   const systemText = normalizeSystemInstructions(body.system);
   const transcriptMessages = canonicalizeMessagesForSession(options.messages || body.messages);
-  const transcript = buildConversationTranscript(transcriptMessages, {
+  const { historyMessages, latestTurnInput } = splitLatestStructuredUserTurn(transcriptMessages, {
+    logger: options.logger,
+  });
+  const transcript = buildConversationTranscript(historyMessages, {
     logger: options.logger,
   });
   const outputInstructions = buildStructuredOutputInstructions(body?.output_config?.format);
@@ -810,13 +738,20 @@ function buildCodexPromptFromAnthropic(body, config, options = {}) {
     dynamicToolAliasInstructions ? `\nFrontend tool alias notes:\n${dynamicToolAliasInstructions}` : "",
     systemText ? `\nSystem instructions:\n${systemText}` : "",
     outputInstructions ? `\nOutput requirements:\n${outputInstructions}` : "",
+    latestTurnInput.length > 0 ? "\nThe latest user turn is attached as structured turn input items after these instructions." : "",
     transcript ? `\nClaude Code transcript:\n${transcript}` : "",
   ]
     .filter(Boolean)
     .join("\n");
 
+  const turnInput = [
+    buildCodexTurnTextInputItem(prompt),
+    ...latestTurnInput,
+  ].filter(Boolean);
+
   return {
     prompt,
+    turnInput,
     outputSchema,
     externalModel: body.model,
     resolvedModel,
@@ -827,6 +762,25 @@ function buildCodexPromptFromAnthropic(body, config, options = {}) {
 
 function approximateTokensFromText(text) {
   return Math.max(1, Math.ceil(String(text || "").length / 4));
+}
+
+function approximateTokensFromTurnInput(turnInput = []) {
+  if (!Array.isArray(turnInput) || turnInput.length === 0) {
+    return 0;
+  }
+
+  return turnInput.reduce((total, item) => {
+    switch (item?.type) {
+      case "text":
+        return total + approximateTokensFromText(item.text);
+      case "image":
+        return total + approximateTokensFromText(item.url || "");
+      case "localImage":
+        return total + approximateTokensFromText(item.path || "");
+      default:
+        return total + approximateTokensFromText(JSON.stringify(item ?? {}));
+    }
+  }, 0);
 }
 
 function buildAnthropicTextResponse(text, externalModel, usage = {}) {
@@ -850,27 +804,6 @@ function buildAnthropicTextResponse(text, externalModel, usage = {}) {
   };
 }
 
-function parseStructuredOutputInput(text, format) {
-  if (!format) {
-    return null;
-  }
-
-  const normalized = normalizeStructuredOutputText(text, format);
-  try {
-    const parsed = JSON.parse(normalized);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return {
-        normalized,
-        parsed,
-      };
-    }
-  } catch {
-    return null;
-  }
-
-  return null;
-}
-
 function buildPersistedAssistantMessage(response) {
   const content = Array.isArray(response?.content) ? response.content : [];
   const textBlocks = content.filter(block => block?.type === "text" && typeof block.text === "string");
@@ -881,22 +814,44 @@ function buildPersistedAssistantMessage(response) {
     };
   }
 
-  const structuredOutputBlock = content.find(
-    block => block?.type === "tool_use" && block?.name === SYNTHETIC_OUTPUT_TOOL_NAME && block.input,
-  );
-  if (structuredOutputBlock) {
-    return {
-      role: "assistant",
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(structuredOutputBlock.input),
-        },
-      ],
-    };
+  return null;
+}
+
+function storedConversationFingerprints(storedConversation) {
+  if (!storedConversation || typeof storedConversation !== "object") {
+    return [];
   }
 
-  return null;
+  if (Array.isArray(storedConversation.messageFingerprints)) {
+    return storedConversation.messageFingerprints.filter(fingerprint => typeof fingerprint === "string");
+  }
+
+  if (Array.isArray(storedConversation.messages)) {
+    return messageFingerprints(canonicalizeMessagesForSession(storedConversation.messages));
+  }
+
+  return [];
+}
+
+function splitIncrementalMessagesFromFingerprints(currentMessages = [], previousFingerprints = []) {
+  if (!Array.isArray(currentMessages) || currentMessages.length === 0) {
+    return null;
+  }
+  if (!Array.isArray(previousFingerprints) || previousFingerprints.length === 0) {
+    return null;
+  }
+  if (previousFingerprints.length >= currentMessages.length) {
+    return null;
+  }
+
+  const currentFingerprints = messageFingerprints(currentMessages);
+  for (let index = 0; index < previousFingerprints.length; index += 1) {
+    if (currentFingerprints[index] !== previousFingerprints[index]) {
+      return null;
+    }
+  }
+
+  return currentMessages.slice(previousFingerprints.length);
 }
 
 async function resolveCodexSessionContext({ body, sessionStore }) {
@@ -921,10 +876,10 @@ async function resolveCodexSessionContext({ body, sessionStore }) {
     cwd,
     conversationKey,
   });
-  const storedMessages = Array.isArray(storedConversation?.messages)
-    ? canonicalizeMessagesForSession(storedConversation.messages)
-    : [];
-  const incrementalMessages = splitIncrementalMessages(canonicalMessages, storedMessages);
+  const incrementalMessages = splitIncrementalMessagesFromFingerprints(
+    canonicalMessages,
+    storedConversationFingerprints(storedConversation),
+  );
   const canResume =
     storedConversation?.metadata?.backend === "codex-app-server" &&
     incrementalMessages &&
@@ -1219,6 +1174,7 @@ async function runCodexTurn({
   config,
   logger,
   prompt,
+  turnInput,
   model,
   effort,
   cwd,
@@ -1237,7 +1193,7 @@ async function runCodexTurn({
   let turnId = null;
   let resumed = false;
   let usage = {
-    input_tokens: approximateTokensFromText(prompt),
+    input_tokens: approximateTokensFromTurnInput(turnInput),
     output_tokens: 0,
   };
   const accumulator = createCodexTurnAccumulator({ onEvent });
@@ -1344,13 +1300,7 @@ async function runCodexTurn({
 
     const turnStart = await client.request("turn/start", {
       threadId,
-      input: [
-        {
-          type: "text",
-          text: prompt,
-          text_elements: [],
-        },
-      ],
+      input: Array.isArray(turnInput) && turnInput.length > 0 ? turnInput : [buildCodexTurnTextInputItem(prompt)],
       model,
       effort,
       summary,
@@ -1393,6 +1343,7 @@ export async function createAppServerCodexTurnController({
   config,
   logger,
   prompt,
+  turnInput,
   model,
   effort,
   cwd,
@@ -1427,7 +1378,7 @@ export async function createAppServerCodexTurnController({
   let completed = false;
   let closed = false;
   let usage = {
-    input_tokens: approximateTokensFromText(prompt),
+    input_tokens: approximateTokensFromTurnInput(turnInput),
     output_tokens: 0,
   };
   let eventHandler = onEvent;
@@ -1615,13 +1566,7 @@ export async function createAppServerCodexTurnController({
 
     const turnStart = await client.request("turn/start", {
       threadId,
-      input: [
-        {
-          type: "text",
-          text: prompt,
-          text_elements: [],
-        },
-      ],
+      input: Array.isArray(turnInput) && turnInput.length > 0 ? turnInput : [buildCodexTurnTextInputItem(prompt)],
       model,
       effort,
       summary,
@@ -1700,6 +1645,7 @@ async function createCodexTurnController({
   config,
   logger,
   prompt,
+  turnInput,
   resolvedModel,
   cwd,
   outputSchema,
@@ -1713,6 +1659,7 @@ async function createCodexTurnController({
     config,
     logger,
     prompt,
+    turnInput,
     model: resolvedModel.targetModel,
     effort: resolvedModel.effort,
     cwd,
@@ -1728,6 +1675,7 @@ async function runCodexTurnDirect({
   config,
   logger,
   prompt,
+  turnInput,
   resolvedModel,
   cwd,
   outputSchema,
@@ -1740,6 +1688,7 @@ async function runCodexTurnDirect({
     config,
     logger,
     prompt,
+    turnInput,
     model: resolvedModel.targetModel,
     effort: resolvedModel.effort,
     cwd,
@@ -2045,41 +1994,6 @@ function writeToolUseStream(res, externalModel, toolName, input, usage, options 
   );
 }
 
-function writeEmptyEndTurnStream(res, externalModel, usage) {
-  const messageId = `msg_${crypto.randomUUID()}`;
-
-  writeSseEvent(res, "message_start", {
-    type: "message_start",
-    message: {
-      id: messageId,
-      type: "message",
-      role: "assistant",
-      model: externalModel,
-      content: [],
-      stop_reason: null,
-      stop_sequence: null,
-      usage: {
-        input_tokens: 0,
-        output_tokens: 0,
-      },
-    },
-  });
-  writeSseEvent(res, "message_delta", {
-    type: "message_delta",
-    delta: {
-      stop_reason: "end_turn",
-      stop_sequence: null,
-    },
-    usage: {
-      input_tokens: usage.input_tokens ?? 0,
-      output_tokens: usage.output_tokens ?? 0,
-    },
-  });
-  writeSseEvent(res, "message_stop", {
-    type: "message_stop",
-  });
-}
-
 function ensureCompletedCodexControllerOutcome(outcome) {
   if (!outcome || outcome.type !== "completed") {
     return outcome;
@@ -2097,34 +2011,9 @@ function ensureCompletedCodexControllerOutcome(outcome) {
 
 function buildCodexCompletionArtifacts({ body, externalModel, result }) {
   const normalizedText = normalizeStructuredOutputText(result.finalMessage, body?.output_config?.format);
-  const structuredOutputTool = findToolByName(body.tools, SYNTHETIC_OUTPUT_TOOL_NAME);
-  const structuredOutputPayload =
-    structuredOutputTool && body?.output_config?.format
-      ? parseStructuredOutputInput(result.finalMessage, body.output_config.format)
-      : null;
-
-  if (structuredOutputTool && structuredOutputPayload) {
-    const response = buildAnthropicToolUseResponse(
-      structuredOutputTool.name,
-      structuredOutputPayload.parsed,
-      externalModel,
-      result.usage,
-    );
-    return {
-      normalizedText,
-      responseKind: "tool_use",
-      response,
-      structuredOutputPayload,
-      structuredOutputTool,
-    };
-  }
-
   return {
     normalizedText,
-    responseKind: "text",
     response: buildAnthropicTextResponse(normalizedText, externalModel, result.usage),
-    structuredOutputPayload: null,
-    structuredOutputTool: null,
   };
 }
 
@@ -2251,6 +2140,7 @@ export function createCodexBackend({
     body,
     sessionContext,
     prompt,
+    turnInput,
     outputSchema,
     resolvedModel,
     dynamicToolRegistry,
@@ -2261,6 +2151,7 @@ export function createCodexBackend({
       config,
       logger,
       prompt,
+      turnInput,
       resolvedModel,
       cwd: sessionContext.cwd,
       outputSchema,
@@ -2294,13 +2185,13 @@ export function createCodexBackend({
         body,
         sessionStore,
       });
-      const { prompt } = buildCodexPromptFromAnthropic(body, config, {
+      const { turnInput } = buildCodexPromptFromAnthropic(body, config, {
         logger,
         messages: sessionContext.promptMessages,
         nativeToolBridge: toolBridgeEnabled,
       });
       return {
-        input_tokens: approximateTokensFromText(prompt),
+        input_tokens: approximateTokensFromTurnInput(turnInput),
       };
     },
     async createMessage(body) {
@@ -2330,12 +2221,6 @@ export function createCodexBackend({
             normalized: previewText(completion.normalizedText),
           });
         }
-        if (completion.responseKind === "tool_use") {
-          logger?.debug?.("Returning StructuredOutput tool_use response", {
-            model: body.model,
-            tool: completion.structuredOutputTool.name,
-          });
-        }
         try {
           await persistCodexAssistantResponse({
             sessionStore,
@@ -2357,7 +2242,8 @@ export function createCodexBackend({
         sessionStore,
       });
       const toolBridgeEnabled = hasNativeAnthropicTools(body);
-      const { prompt, outputSchema, externalModel, resolvedModel, dynamicToolRegistry } = buildCodexPromptFromAnthropic(
+      const { prompt, turnInput, outputSchema, externalModel, resolvedModel, dynamicToolRegistry } =
+        buildCodexPromptFromAnthropic(
         body,
         config,
         {
@@ -2366,24 +2252,13 @@ export function createCodexBackend({
           nativeToolBridge: toolBridgeEnabled,
         },
       );
-      if (shouldFinalizeStructuredOutputTurn(body.messages)) {
-        logger?.debug?.("Finalizing structured output turn without another Codex request", {
-          model: body.model,
-        });
-        await saveCodexConversationSnapshot({
-          sessionStore,
-          body,
-          messages: sessionContext.canonicalMessages,
-          metadata: sessionContext.storedConversation?.metadata,
-        });
-        return buildAnthropicEmptyResponse(externalModel);
-      }
 
       if (toolBridgeEnabled) {
         const { controller, outcome } = await startToolBridgeTurn({
           body,
           sessionContext,
           prompt,
+          turnInput,
           outputSchema,
           resolvedModel,
           dynamicToolRegistry,
@@ -2417,12 +2292,6 @@ export function createCodexBackend({
             normalized: previewText(completion.normalizedText),
           });
         }
-        if (completion.responseKind === "tool_use") {
-          logger?.debug?.("Returning StructuredOutput tool_use response", {
-            model: body.model,
-            tool: completion.structuredOutputTool.name,
-          });
-        }
         try {
           await persistCodexAssistantResponse({
             sessionStore,
@@ -2441,6 +2310,7 @@ export function createCodexBackend({
         config,
         logger,
         prompt,
+        turnInput,
         resolvedModel,
         cwd: sessionContext.cwd,
         outputSchema,
@@ -2460,12 +2330,6 @@ export function createCodexBackend({
         logger?.debug?.("Structured output normalization", {
           raw: previewText(result.finalMessage),
           normalized: previewText(completion.normalizedText),
-        });
-      }
-      if (completion.responseKind === "tool_use") {
-        logger?.debug?.("Returning StructuredOutput tool_use response", {
-          model: body.model,
-          tool: completion.structuredOutputTool.name,
         });
       }
       await persistCodexAssistantResponse({
@@ -2490,14 +2354,7 @@ export function createCodexBackend({
           externalModel: body.model,
           includeThinking: thinkingEnabled,
         });
-        const pendingStructuredOutputTool = findToolByName(body.tools, SYNTHETIC_OUTPUT_TOOL_NAME);
-        const useBufferedPendingStructuredOutput = Boolean(
-          pendingStructuredOutputTool && body?.output_config?.format,
-        );
-        const pendingOutcome = await continuePendingToolSession(
-          body,
-          useBufferedPendingStructuredOutput ? undefined : event => pendingStreamBridge.handle(event),
-        );
+        const pendingOutcome = await continuePendingToolSession(body, event => pendingStreamBridge.handle(event));
         if (pendingOutcome) {
           const { controller, outcome } = pendingOutcome;
           if (outcome.type === "tool_request") {
@@ -2523,30 +2380,12 @@ export function createCodexBackend({
               body,
               canonicalMessages: canonicalizeMessagesForSession(body?.messages),
               response: completion.response,
-                metadata: buildCompletedCodexMetadata(outcome.result, {
-                  targetModel: outcome.result.model || controller.getMetadata().model || body.model,
-                }),
+              metadata: buildCompletedCodexMetadata(outcome.result, {
+                targetModel: outcome.result.model || controller.getMetadata().model || body.model,
+              }),
             });
           } finally {
             await controller.close();
-          }
-
-          if (completion.responseKind === "tool_use") {
-            logger?.debug?.("Returning StructuredOutput tool_use stream", {
-              model: body.model,
-              tool: completion.structuredOutputTool.name,
-            });
-            writeToolUseStream(
-              res,
-              body.model,
-              completion.structuredOutputTool.name,
-              completion.structuredOutputPayload.parsed,
-              outcome.result.usage,
-              {
-                toolUseId: completion.response.content[0]?.id,
-              },
-            );
-            return;
           }
 
           pendingStreamBridge.emitFallback({
@@ -2561,47 +2400,29 @@ export function createCodexBackend({
           sessionStore,
           body,
         });
-        const { prompt, outputSchema, externalModel, resolvedModel, dynamicToolRegistry } =
+        const { prompt, turnInput, outputSchema, externalModel, resolvedModel, dynamicToolRegistry } =
           buildCodexPromptFromAnthropic(body, config, {
             logger,
             messages: sessionContext.promptMessages,
             nativeToolBridge: toolBridgeEnabled,
           });
-        if (shouldFinalizeStructuredOutputTurn(body.messages)) {
-          logger?.debug?.("Finalizing structured output turn without another Codex request", {
-            model: body.model,
-            stream: true,
-          });
-          await saveCodexConversationSnapshot({
-            sessionStore,
-            body,
-            messages: sessionContext.canonicalMessages,
-            metadata: sessionContext.storedConversation?.metadata,
-          });
-          writeEmptyEndTurnStream(res, externalModel, {});
-          return;
-        }
-
-        const structuredOutputTool = findToolByName(body.tools, SYNTHETIC_OUTPUT_TOOL_NAME);
-        const useBufferedStructuredOutput = Boolean(structuredOutputTool && body?.output_config?.format);
-        const streamBridge = !useBufferedStructuredOutput
-          ? createCodexStreamBridge({
-              res,
-              externalModel,
-              includeThinking: thinkingEnabled,
-            })
-          : null;
+        const streamBridge = createCodexStreamBridge({
+          res,
+          externalModel,
+          includeThinking: thinkingEnabled,
+        });
 
         if (toolBridgeEnabled) {
           const { controller, outcome } = await startToolBridgeTurn({
             body,
             sessionContext,
             prompt,
+            turnInput,
             outputSchema,
             resolvedModel,
             dynamicToolRegistry,
             thinkingEnabled,
-            onEvent: streamBridge ? event => streamBridge.handle(event) : undefined,
+            onEvent: event => streamBridge.handle(event),
           });
 
           if (outcome.type === "tool_request") {
@@ -2610,21 +2431,8 @@ export function createCodexBackend({
               toolCall: outcome.toolCall,
             });
 
-            if (streamBridge) {
-              streamBridge.emitToolUse(outcome.toolCall);
-              streamBridge.finish(outcome.usage, "tool_use");
-            } else {
-              writeToolUseStream(
-                res,
-                externalModel,
-                outcome.toolCall.name,
-                outcome.toolCall.input,
-                outcome.usage,
-                {
-                  toolUseId: outcome.toolCall.id,
-                },
-              );
-            }
+            streamBridge.emitToolUse(outcome.toolCall);
+            streamBridge.finish(outcome.usage, "tool_use");
             return;
           }
 
@@ -2651,37 +2459,11 @@ export function createCodexBackend({
             await controller.close();
           }
 
-          if (completion.responseKind === "tool_use") {
-            logger?.debug?.("Returning StructuredOutput tool_use stream", {
-              model: body.model,
-              tool: completion.structuredOutputTool.name,
-            });
-            writeToolUseStream(
-              res,
-              externalModel,
-              completion.structuredOutputTool.name,
-              completion.structuredOutputPayload.parsed,
-              outcome.result.usage,
-              {
-                toolUseId: completion.response.content[0]?.id,
-              },
-            );
-            return;
-          }
-
-          if (streamBridge) {
-            streamBridge.emitFallback({
-              text: completion.normalizedText,
-              reasoningSummaries: thinkingEnabled ? outcome.result.reasoningSummaries : [],
-            });
-            streamBridge.finish(outcome.result.usage);
-          } else {
-            const fallbackWriter = createAnthropicStreamWriter(res, externalModel);
-            if (completion.normalizedText) {
-              fallbackWriter.appendText("agent:fallback", completion.normalizedText);
-            }
-            fallbackWriter.finish(outcome.result.usage, "end_turn");
-          }
+          streamBridge.emitFallback({
+            text: completion.normalizedText,
+            reasoningSummaries: thinkingEnabled ? outcome.result.reasoningSummaries : [],
+          });
+          streamBridge.finish(outcome.result.usage);
           return;
         }
 
@@ -2689,6 +2471,7 @@ export function createCodexBackend({
           config,
           logger,
           prompt,
+          turnInput,
           resolvedModel,
           cwd: sessionContext.cwd,
           outputSchema,
@@ -2698,7 +2481,7 @@ export function createCodexBackend({
             threadId: sessionContext.resumeThreadId,
             threadPath: sessionContext.resumeThreadPath,
           },
-          onEvent: streamBridge ? event => streamBridge.handle(event) : undefined,
+          onEvent: event => streamBridge.handle(event),
         });
         const completion = buildCodexCompletionArtifacts({
           body,
@@ -2711,12 +2494,6 @@ export function createCodexBackend({
             normalized: previewText(completion.normalizedText),
           });
         }
-        if (completion.responseKind === "tool_use") {
-          logger?.debug?.("Returning StructuredOutput tool_use stream", {
-            model: body.model,
-            tool: completion.structuredOutputTool.name,
-          });
-        }
         await persistCodexAssistantResponse({
           sessionStore,
           body,
@@ -2725,30 +2502,11 @@ export function createCodexBackend({
           metadata: buildCompletedCodexMetadata(result, resolvedModel),
         });
 
-        if (completion.responseKind === "tool_use") {
-          writeToolUseStream(
-            res,
-            externalModel,
-            completion.structuredOutputTool.name,
-            completion.structuredOutputPayload.parsed,
-            result.usage,
-            {
-              toolUseId: completion.response.content[0]?.id,
-            },
-          );
-        } else if (streamBridge) {
-          streamBridge.emitFallback({
-            text: completion.normalizedText,
-            reasoningSummaries: thinkingEnabled ? result.reasoningSummaries : [],
-          });
-          streamBridge.finish(result.usage);
-        } else {
-          const fallbackWriter = createAnthropicStreamWriter(res, externalModel);
-          if (completion.normalizedText) {
-            fallbackWriter.appendText("agent:fallback", completion.normalizedText);
-          }
-          fallbackWriter.finish(result.usage, "end_turn");
-        }
+        streamBridge.emitFallback({
+          text: completion.normalizedText,
+          reasoningSummaries: thinkingEnabled ? result.reasoningSummaries : [],
+        });
+        streamBridge.finish(result.usage);
       } catch (error) {
         writeSseEvent(res, "error", makeAnthropicErrorPayload(error));
       } finally {

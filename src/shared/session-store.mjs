@@ -127,8 +127,12 @@ function buildSessionMetadata(metadata = {}) {
   };
 }
 
+function buildMessageFingerprints(messages = []) {
+  return messages.map(message => JSON.stringify(message));
+}
+
 function normalizeStoredEntry(entry) {
-  if (!entry || typeof entry !== "object" || !Array.isArray(entry.messages) || entry.messages.length === 0) {
+  if (!entry || typeof entry !== "object") {
     return null;
   }
 
@@ -137,12 +141,23 @@ function normalizeStoredEntry(entry) {
     return null;
   }
 
+  const storedFingerprints = Array.isArray(entry.messageFingerprints)
+    ? entry.messageFingerprints.filter(fingerprint => typeof fingerprint === "string")
+    : Array.isArray(entry.messages)
+      ? buildMessageFingerprints(entry.messages)
+      : [];
+  if (storedFingerprints.length === 0) {
+    return null;
+  }
+
   return {
     cwd,
     workspaceId: keyForCwd(cwd),
     conversationKey: normalizeConversationKey(entry.conversationKey),
     updatedAt: entry.updatedAt,
-    messages: entry.messages,
+    messageFingerprints: storedFingerprints,
+    messageCount:
+      Number.isInteger(entry.messageCount) && entry.messageCount > 0 ? entry.messageCount : storedFingerprints.length,
     metadata: buildSessionMetadata(entry.metadata),
   };
 }
@@ -199,7 +214,8 @@ export function createFileSessionStore({
           [keyForConversation(normalizedCwd, normalizedConversationKey)]: {
             cwd: normalizedCwd,
             updatedAt: new Date().toISOString(),
-            messages: messages.slice(-maxMessages),
+            messageFingerprints: buildMessageFingerprints(messages.slice(-maxMessages)),
+            messageCount: messages.length,
             ...(normalizedConversationKey ? { conversationKey: normalizedConversationKey } : {}),
             ...(normalizedMetadata ? { metadata: normalizedMetadata } : {}),
           },
@@ -220,6 +236,7 @@ export function createFileSessionStore({
       logger?.debug?.("Saved recent proxy conversation", {
         cwd: normalizedCwd,
         conversationKey: normalizedConversationKey,
+        messageFingerprintCount: Math.min(messages.length, maxMessages),
         messageCount: messages.length,
         metadata: normalizedMetadata,
         filePath,
