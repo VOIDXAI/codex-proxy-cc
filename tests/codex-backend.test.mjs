@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  buildCodexAppServerCapabilities,
   createAppServerCodexTurnController,
   createCodexBackend,
 } from "../src/backends/codex-backend.mjs";
@@ -237,6 +238,82 @@ test("app-server turn controller queues concurrent tool calls instead of overwri
       success: true,
     },
   ]);
+
+  await controller.close();
+});
+
+test("buildCodexAppServerCapabilities enables experimental API for direct turns", () => {
+  assert.deepEqual(buildCodexAppServerCapabilities(), {
+    experimentalApi: true,
+    optOutNotificationMethods: [
+      "command/exec/outputDelta",
+      "item/fileChange/outputDelta",
+      "item/reasoning/textDelta",
+    ],
+  });
+});
+
+test("buildCodexAppServerCapabilities keeps reasoning deltas enabled for tool-bridge turns", () => {
+  assert.deepEqual(buildCodexAppServerCapabilities({ receiveReasoningDeltas: true }), {
+    experimentalApi: true,
+    optOutNotificationMethods: [
+      "command/exec/outputDelta",
+      "item/fileChange/outputDelta",
+    ],
+  });
+});
+
+test("app-server turn controller always requests experimental API capabilities", async () => {
+  const connections = [];
+  const fakeClient = {
+    stderr: "",
+    setServerRequestHandler() {},
+    setNotificationHandler() {},
+    async request(method) {
+      switch (method) {
+        case "thread/start":
+          return {
+            thread: {
+              id: "thread_caps",
+              path: "/tmp/thread-caps.json",
+            },
+          };
+        case "turn/start":
+          return {
+            turn: {
+              id: "turn_caps",
+            },
+          };
+        default:
+          throw new Error(`Unexpected app-server request: ${method}`);
+      }
+    },
+    async close() {},
+  };
+
+  const controller = await createAppServerCodexTurnController({
+    config: DEFAULT_CONFIG,
+    logger: null,
+    prompt: "Hello.",
+    model: "gpt-5.4",
+    effort: "medium",
+    cwd: process.cwd(),
+    outputSchema: null,
+    connectAppServer: async (cwd, options) => {
+      connections.push({ cwd, options });
+      return fakeClient;
+    },
+  });
+
+  assert.equal(connections.length, 1);
+  assert.deepEqual(connections[0].options.capabilities, {
+    experimentalApi: true,
+    optOutNotificationMethods: [
+      "command/exec/outputDelta",
+      "item/fileChange/outputDelta",
+      "item/reasoning/textDelta",
+    ],
+  });
 
   await controller.close();
 });
@@ -968,6 +1045,134 @@ test("codex backend ignores unknown Anthropic content blocks and logs a warning"
   assert.equal(warnings.length, 1);
   assert.equal(warnings[0].message, "Ignoring unsupported Anthropic content block");
   assert.equal(warnings[0].details.blockType, "audio");
+});
+
+test("codex backend logs resolved model routing to runtime loggers", async () => {
+  const infos = [];
+  const backend = createCodexBackend({
+    config: DEFAULT_CONFIG,
+    logger: {
+      console: false,
+      info(message, details) {
+        infos.push({ message, details });
+      },
+    },
+    async runTurn() {
+      return {
+        finalMessage: "logged-route",
+        usage: {
+          input_tokens: 10,
+          output_tokens: 2,
+        },
+      };
+    },
+  });
+
+  await backend.createMessage({
+    model: "opus",
+    messages: [{ role: "user", content: "hello" }],
+  });
+
+  assert.equal(infos.length, 1);
+  assert.equal(infos[0].message, "Codex model routing");
+  assert.deepEqual(infos[0].details, {
+    externalModel: "opus",
+    anthropicEffort: null,
+    profile: "opus",
+    targetModel: "gpt-5.4",
+    effort: "xhigh",
+    stream: false,
+    nativeToolBridge: false,
+  });
+});
+
+test("codex backend routes model logging to debug for console loggers", async () => {
+  const infos = [];
+  const debugs = [];
+  const backend = createCodexBackend({
+    config: DEFAULT_CONFIG,
+    logger: {
+      console: true,
+      info(message, details) {
+        infos.push({ message, details });
+      },
+      debug(message, details) {
+        debugs.push({ message, details });
+      },
+    },
+    async runTurn() {
+      return {
+        finalMessage: "logged-route",
+        usage: {
+          input_tokens: 10,
+          output_tokens: 2,
+        },
+      };
+    },
+  });
+
+  await backend.createMessage({
+    model: "claude-opus-4-6",
+    messages: [{ role: "user", content: "hello" }],
+    output_config: {
+      effort: "max",
+    },
+  });
+
+  assert.equal(infos.length, 0);
+  assert.equal(debugs.length, 1);
+  assert.equal(debugs[0].message, "Codex model routing");
+  assert.deepEqual(debugs[0].details, {
+    externalModel: "claude-opus-4-6",
+    anthropicEffort: "max",
+    profile: "opus",
+    targetModel: "gpt-5.4",
+    effort: "xhigh",
+    stream: false,
+    nativeToolBridge: false,
+  });
+});
+
+test("codex backend prefers opus routing for direct gpt-5.4 requests with high effort", async () => {
+  const infos = [];
+  const backend = createCodexBackend({
+    config: DEFAULT_CONFIG,
+    logger: {
+      console: false,
+      info(message, details) {
+        infos.push({ message, details });
+      },
+    },
+    async runTurn() {
+      return {
+        finalMessage: "logged-route",
+        usage: {
+          input_tokens: 10,
+          output_tokens: 2,
+        },
+      };
+    },
+  });
+
+  await backend.createMessage({
+    model: "gpt-5.4",
+    messages: [{ role: "user", content: "hello" }],
+    output_config: {
+      effort: "high",
+    },
+  });
+
+  assert.equal(infos.length, 1);
+  assert.equal(infos[0].message, "Codex model routing");
+  assert.deepEqual(infos[0].details, {
+    externalModel: "gpt-5.4",
+    anthropicEffort: "high",
+    profile: "opus",
+    targetModel: "gpt-5.4",
+    effort: "xhigh",
+    stream: false,
+    nativeToolBridge: false,
+  });
 });
 
 test("codex backend surfaces unsupported Codex models instead of retrying with a fallback", async () => {

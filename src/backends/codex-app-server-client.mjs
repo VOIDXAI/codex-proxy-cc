@@ -11,7 +11,7 @@ const DEFAULT_CLIENT_INFO = {
 };
 
 const DEFAULT_CAPABILITIES = {
-  experimentalApi: false,
+  experimentalApi: true,
   optOutNotificationMethods: [
     "command/exec/outputDelta",
     "item/fileChange/outputDelta",

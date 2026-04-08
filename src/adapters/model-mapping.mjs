@@ -59,6 +59,10 @@ function findProfileForDirectModel(config, externalModel) {
     return null;
   }
 
+  if (matches.includes("opus")) {
+    return "opus";
+  }
+
   const defaultProfile = config.anthropic.defaultProfile || "sonnet";
   if (matches.includes(defaultProfile)) {
     return defaultProfile;
@@ -119,6 +123,10 @@ export function resolveModelConfig(config, externalModel, anthropicEffort) {
     } else {
       effort = mappedEffort;
     }
+  }
+
+  if (profileName === "opus" && effort === "high") {
+    effort = "xhigh";
   }
 
   if (!KNOWN_REASONING_EFFORTS.has(effort)) {

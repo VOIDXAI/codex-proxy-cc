@@ -28,7 +28,7 @@ export const DEFAULT_CONFIG = {
     opus: {
       model: "gpt-5.4-pro",
       codexModel: "gpt-5.4",
-      effort: "high",
+      effort: "xhigh",
     },
   },
   anthropic: {

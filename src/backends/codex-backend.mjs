@@ -7,6 +7,24 @@ import { resolveModelConfig } from "../adapters/model-mapping.mjs";
 
 const RESERVED_DYNAMIC_TOOL_NAME_PREFIXES = ["mcp__"];
 const SAFE_DYNAMIC_TOOL_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,127}$/u;
+const DEFAULT_APP_SERVER_OPT_OUT_NOTIFICATION_METHODS = [
+  "command/exec/outputDelta",
+  "item/fileChange/outputDelta",
+  "item/reasoning/textDelta",
+];
+const REASONING_ENABLED_APP_SERVER_OPT_OUT_NOTIFICATION_METHODS = [
+  "command/exec/outputDelta",
+  "item/fileChange/outputDelta",
+];
+
+export function buildCodexAppServerCapabilities({ receiveReasoningDeltas = false } = {}) {
+  return {
+    experimentalApi: true,
+    optOutNotificationMethods: receiveReasoningDeltas
+      ? REASONING_ENABLED_APP_SERVER_OPT_OUT_NOTIFICATION_METHODS
+      : DEFAULT_APP_SERVER_OPT_OUT_NOTIFICATION_METHODS,
+  };
+}
 
 function stringifyBlock(value) {
   try {
@@ -828,6 +846,19 @@ function buildCodexPromptFromAnthropic(body, config, options = {}) {
   };
 }
 
+function logResolvedModelRouting(logger, body, resolvedModel, options = {}) {
+  const logLevel = logger?.console === false ? "info" : "debug";
+  logger?.[logLevel]?.("Codex model routing", {
+    externalModel: body?.model,
+    anthropicEffort: body?.output_config?.effort ?? null,
+    profile: resolvedModel.profileName,
+    targetModel: resolvedModel.targetModel,
+    effort: resolvedModel.effort,
+    stream: Boolean(options.stream),
+    nativeToolBridge: Boolean(options.nativeToolBridge),
+  });
+}
+
 function approximateTokensFromText(text) {
   return Math.max(1, Math.ceil(String(text || "").length / 4));
 }
@@ -1299,6 +1330,7 @@ async function runCodexTurn({
   const client = await connectCodexAppServer(cwd, {
     command: config.codex.binary,
     env: process.env,
+    capabilities: buildCodexAppServerCapabilities(),
   });
 
   let threadId = null;
@@ -1477,16 +1509,9 @@ export async function createAppServerCodexTurnController({
   const client = await connectAppServer(cwd, {
     command: config.codex.binary,
     env: process.env,
-    capabilities:
-      dynamicTools.length > 0
-        ? {
-            experimentalApi: true,
-            optOutNotificationMethods: [
-              "command/exec/outputDelta",
-              "item/fileChange/outputDelta",
-            ],
-          }
-        : undefined,
+    capabilities: buildCodexAppServerCapabilities({
+      receiveReasoningDeltas: dynamicTools.length > 0,
+    }),
   });
 
   let threadId = null;
@@ -2423,6 +2448,10 @@ export function createCodexBackend({
           nativeToolBridge: toolBridgeEnabled,
         },
       );
+      logResolvedModelRouting(logger, body, resolvedModel, {
+        stream: false,
+        nativeToolBridge: toolBridgeEnabled,
+      });
 
       if (toolBridgeEnabled) {
         const { controller, outcome } = await startToolBridgeTurn({
@@ -2578,6 +2607,10 @@ export function createCodexBackend({
             messages: sessionContext.promptMessages,
             nativeToolBridge: toolBridgeEnabled,
           });
+        logResolvedModelRouting(logger, body, resolvedModel, {
+          stream: true,
+          nativeToolBridge: toolBridgeEnabled,
+        });
         const streamBridge = createCodexStreamBridge({
           res,
           externalModel,

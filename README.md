@@ -138,14 +138,20 @@ Default profiles:
 
 - `haiku` -> `gpt-5.4-mini` + `low`
 - `sonnet` -> `gpt-5.4` + `medium`
-- `opus` -> `gpt-5.4` + `high`
+- `opus` -> `gpt-5.4` + `xhigh`
 
 Anthropic effort overrides are mapped like this:
 
 - `low -> low`
 - `medium -> medium`
-- `high -> high`
+- `high -> high` for non-Opus profiles
+- `high -> xhigh` for profile `opus`
 - `max -> xhigh`
+
+Direct model ids are also accepted:
+
+- `gpt-5.4-mini` -> profile `haiku`
+- `gpt-5.4` -> profile `opus` when the target is ambiguous between `sonnet` and `opus`
 
 ## Configuration
 
@@ -177,7 +183,7 @@ Example:
   "profiles": {
     "haiku": { "model": "gpt-5-mini", "codexModel": "gpt-5.4-mini", "effort": "low" },
     "sonnet": { "model": "gpt-5.4", "codexModel": "gpt-5.4", "effort": "medium" },
-    "opus": { "model": "gpt-5.4-pro", "codexModel": "gpt-5.4", "effort": "high" }
+    "opus": { "model": "gpt-5.4-pro", "codexModel": "gpt-5.4", "effort": "xhigh" }
   },
   "anthropic": {
     "defaultProfile": "sonnet",
@@ -201,6 +207,14 @@ Example:
   }
 }
 ```
+
+Interactive TUI runs also write resolved routing lines to the runtime log at the
+default state path `~/.local/state/codex-proxy-cc/runtime.log`:
+
+- external Claude-facing model
+- Anthropic effort override, if present
+- matched profile
+- final Codex target model and reasoning effort
 
 Privacy toggles are opt-in. By default the launcher leaves Claude Code's native
 feature and auth surface intact so built-in commands like `/usage`,
