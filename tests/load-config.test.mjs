@@ -181,3 +181,19 @@ test("loadConfig supports Claude effort level overrides", async () => {
     },
   );
 });
+
+test("loadConfig supports native tool timeout overrides", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "codex-proxy-cc-config-"));
+  const configPath = path.join(dir, "config.json");
+
+  await withEnv(
+    {
+      CODEX_PROXY_CC_CONFIG: undefined,
+      CODEX_PROXY_CC_NATIVE_TOOL_TIMEOUT_MS: "45000",
+    },
+    async () => {
+      const { config } = await loadConfig({ configPath });
+      assert.equal(config.codex.nativeToolTimeoutMs, 45000);
+    },
+  );
+});

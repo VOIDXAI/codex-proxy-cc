@@ -228,6 +228,7 @@ function envOverrides(baseConfig) {
   return {
     codex: {
       binary: process.env.CODEX_PROXY_CC_CODEX_BINARY,
+      nativeToolTimeoutMs: parseInteger(process.env.CODEX_PROXY_CC_NATIVE_TOOL_TIMEOUT_MS, undefined),
     },
     server: {
       bind: process.env.CODEX_PROXY_CC_BIND,
@@ -247,6 +248,9 @@ function envOverrides(baseConfig) {
 function validateConfig(config) {
   if (!config.codex?.binary) {
     throw new AppError("codex.binary is required");
+  }
+  if (!Number.isInteger(config.codex?.nativeToolTimeoutMs) || config.codex.nativeToolTimeoutMs < 0) {
+    throw new AppError("codex.nativeToolTimeoutMs must be a non-negative integer");
   }
   if (!config.server?.bind) {
     throw new AppError("server.bind is required");

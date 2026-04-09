@@ -182,7 +182,8 @@ Example:
 {
   "codex": {
     "binary": "codex",
-    "sandbox": "workspace-write"
+    "sandbox": "workspace-write",
+    "nativeToolTimeoutMs": 120000
   },
   "server": {
     "bind": "127.0.0.1",
@@ -230,6 +231,7 @@ default state path `~/.local/state/codex-proxy-cc/runtime.log`:
 - Anthropic effort override, if present
 - matched profile
 - final Codex target model and reasoning effort
+- native tool-bridge dispatch, result, and timeout diagnostics
 
 Privacy toggles are opt-in. By default the launcher leaves Claude Code's native
 feature and auth surface intact so built-in commands like `/usage`,
@@ -244,6 +246,7 @@ Environment overrides:
 
 - `CODEX_PROXY_CC_CONFIG`
 - `CODEX_PROXY_CC_CODEX_BINARY`
+- `CODEX_PROXY_CC_NATIVE_TOOL_TIMEOUT_MS`
 - `CODEX_PROXY_CC_BIND`
 - `CODEX_PROXY_CC_PORT`
 - `CODEX_PROXY_CC_CLAUDE_BINARY`

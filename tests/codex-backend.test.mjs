@@ -242,6 +242,245 @@ test("app-server turn controller queues concurrent tool calls instead of overwri
   await controller.close();
 });
 
+test("app-server turn controller logs native tool dispatch and result events to runtime loggers", async () => {
+  let serverRequestHandler = null;
+  let notificationHandler = null;
+  const infos = [];
+  const fakeClient = {
+    stderr: "",
+    setServerRequestHandler(handler) {
+      serverRequestHandler = handler;
+    },
+    setNotificationHandler(handler) {
+      notificationHandler = handler;
+    },
+    async request(method) {
+      switch (method) {
+        case "thread/start":
+          return {
+            thread: {
+              id: "thread_log_tool",
+              path: "/tmp/thread-log-tool.json",
+            },
+          };
+        case "turn/start":
+          queueMicrotask(() => {
+            const toolRequest = serverRequestHandler({
+              id: 1,
+              method: "item/tool/call",
+              params: {
+                callId: "call_log_1",
+                tool: "WebFetch",
+                arguments: {
+                  url: "https://example.com",
+                },
+              },
+            });
+
+            toolRequest.then(() => {
+              notificationHandler({
+                method: "item/started",
+                params: {
+                  item: {
+                    type: "agentMessage",
+                    id: "agent_log_1",
+                    phase: "final_answer",
+                  },
+                },
+              });
+              notificationHandler({
+                method: "item/agentMessage/delta",
+                params: {
+                  itemId: "agent_log_1",
+                  delta: "done",
+                },
+              });
+              notificationHandler({
+                method: "item/completed",
+                params: {
+                  item: {
+                    type: "agentMessage",
+                    id: "agent_log_1",
+                    phase: "final_answer",
+                    text: "done",
+                  },
+                },
+              });
+              notificationHandler({
+                method: "turn/completed",
+                params: {
+                  turn: {
+                    status: "completed",
+                  },
+                },
+              });
+            }).catch(() => {});
+          });
+          return {
+            turn: {
+              id: "turn_log_tool",
+            },
+          };
+        default:
+          throw new Error(`Unexpected app-server request: ${method}`);
+      }
+    },
+    async close() {},
+  };
+
+  const controller = await createAppServerCodexTurnController({
+    config: DEFAULT_CONFIG,
+    logger: {
+      console: false,
+      info(message, details) {
+        infos.push({ message, details });
+      },
+    },
+    prompt: "Fetch the docs.",
+    model: "gpt-5.4",
+    effort: "medium",
+    cwd: process.cwd(),
+    outputSchema: null,
+    dynamicTools: [
+      {
+        name: "WebFetch",
+        inputSchema: {
+          type: "object",
+          properties: {
+            url: { type: "string" },
+          },
+        },
+      },
+    ],
+    connectAppServer: async () => fakeClient,
+  });
+
+  const firstOutcome = await controller.waitForStop();
+  assert.equal(firstOutcome.type, "tool_request");
+  assert.equal(firstOutcome.toolCall.id, "call_log_1");
+
+  const completion = await controller.resumeWithToolResult({
+    contentItems: [{ type: "inputText", text: "ok" }],
+    success: true,
+  });
+  assert.equal(completion.type, "completed");
+  assert.equal(completion.result.finalMessage, "done");
+
+  assert.equal(infos.length, 2);
+  assert.equal(infos[0].message, "Codex native tool dispatched");
+  assert.equal(infos[0].details.callId, "call_log_1");
+  assert.equal(infos[0].details.tool, "WebFetch");
+  assert.equal(infos[0].details.timeoutMs, DEFAULT_CONFIG.codex.nativeToolTimeoutMs);
+  assert.equal(infos[1].message, "Codex native tool result received");
+  assert.equal(infos[1].details.callId, "call_log_1");
+  assert.equal(infos[1].details.tool, "WebFetch");
+  assert.equal(infos[1].details.success, true);
+
+  await controller.close();
+});
+
+test("app-server turn controller times out stalled native tool calls and logs a warning", async () => {
+  let serverRequestHandler = null;
+  let closed = false;
+  let timedOutError = null;
+  const warnings = [];
+  const fakeClient = {
+    stderr: "",
+    setServerRequestHandler(handler) {
+      serverRequestHandler = handler;
+    },
+    setNotificationHandler() {},
+    async request(method) {
+      switch (method) {
+        case "thread/start":
+          return {
+            thread: {
+              id: "thread_timeout_tool",
+              path: "/tmp/thread-timeout-tool.json",
+            },
+          };
+        case "turn/start":
+          queueMicrotask(() => {
+            serverRequestHandler({
+              id: 1,
+              method: "item/tool/call",
+              params: {
+                callId: "call_timeout_1",
+                tool: "WebFetch",
+                arguments: {
+                  url: "https://example.com/slow",
+                },
+              },
+            }).catch(error => {
+              timedOutError = error;
+            });
+          });
+          return {
+            turn: {
+              id: "turn_timeout_tool",
+            },
+          };
+        default:
+          throw new Error(`Unexpected app-server request: ${method}`);
+      }
+    },
+    async close() {
+      closed = true;
+    },
+  };
+
+  const controller = await createAppServerCodexTurnController({
+    config: {
+      ...DEFAULT_CONFIG,
+      codex: {
+        ...DEFAULT_CONFIG.codex,
+        nativeToolTimeoutMs: 20,
+      },
+    },
+    logger: {
+      console: false,
+      warn(message, details) {
+        warnings.push({ message, details });
+      },
+    },
+    prompt: "Fetch the docs.",
+    model: "gpt-5.4",
+    effort: "medium",
+    cwd: process.cwd(),
+    outputSchema: null,
+    dynamicTools: [
+      {
+        name: "WebFetch",
+        inputSchema: {
+          type: "object",
+          properties: {
+            url: { type: "string" },
+          },
+        },
+      },
+    ],
+    connectAppServer: async () => fakeClient,
+  });
+
+  const firstOutcome = await controller.waitForStop();
+  assert.equal(firstOutcome.type, "tool_request");
+  assert.equal(firstOutcome.toolCall.id, "call_timeout_1");
+
+  await new Promise(resolve => setTimeout(resolve, 80));
+
+  assert.ok(timedOutError instanceof AppError);
+  assert.match(timedOutError.message, /timed out/i);
+  assert.equal(controller.isClosed(), true);
+  assert.equal(closed, true);
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].message, "Codex native tool timed out");
+  assert.equal(warnings[0].details.callId, "call_timeout_1");
+  assert.equal(warnings[0].details.tool, "WebFetch");
+  assert.equal(warnings[0].details.timeoutMs, 20);
+
+  await controller.close();
+});
+
 test("buildCodexAppServerCapabilities enables experimental API for direct turns", () => {
   assert.deepEqual(buildCodexAppServerCapabilities(), {
     experimentalApi: true,

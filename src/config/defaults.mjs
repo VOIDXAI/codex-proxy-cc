@@ -2,6 +2,7 @@ export const DEFAULT_CONFIG = {
   codex: {
     binary: "codex",
     sandbox: "workspace-write",
+    nativeToolTimeoutMs: 120000,
   },
   server: {
     bind: "127.0.0.1",

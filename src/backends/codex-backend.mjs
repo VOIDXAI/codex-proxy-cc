@@ -859,6 +859,16 @@ function logResolvedModelRouting(logger, body, resolvedModel, options = {}) {
   });
 }
 
+function logNativeToolBridgeEvent(logger, message, details = {}, options = {}) {
+  if (options.warn) {
+    logger?.warn?.(message, details);
+    return;
+  }
+
+  const logLevel = logger?.console === false ? "info" : "debug";
+  logger?.[logLevel]?.(message, details);
+}
+
 function approximateTokensFromText(text) {
   return Math.max(1, Math.ceil(String(text || "").length / 4));
 }
@@ -1520,6 +1530,9 @@ export async function createAppServerCodexTurnController({
   let resumed = false;
   let completed = false;
   let closed = false;
+  const nativeToolTimeoutMs = Number.isInteger(config?.codex?.nativeToolTimeoutMs)
+    ? config.codex.nativeToolTimeoutMs
+    : 120000;
   let usage = {
     input_tokens: approximateTokensFromTurnInput(turnInput),
     output_tokens: 0,
@@ -1563,6 +1576,107 @@ export async function createAppServerCodexTurnController({
     return pendingToolRequests[0] || null;
   }
 
+  function buildPendingToolRequestLogDetails(request, extra = {}) {
+    return {
+      callId: request?.callId || null,
+      tool: request?.tool || null,
+      timeoutMs: request?.timeoutMs ?? nativeToolTimeoutMs,
+      elapsedMs: Number.isFinite(request?.emittedAt) ? Math.max(0, Date.now() - request.emittedAt) : null,
+      queuedRequests: pendingToolRequests.length,
+      threadId,
+      turnId,
+      model,
+      ...extra,
+    };
+  }
+
+  function clearPendingToolRequestTimer(request) {
+    if (!request?.timeoutHandle) {
+      return;
+    }
+    clearTimeout(request.timeoutHandle);
+    request.timeoutHandle = null;
+  }
+
+  function settlePendingToolRequest(request, action, value) {
+    if (!request || request.settled) {
+      return false;
+    }
+
+    request.settled = true;
+    clearPendingToolRequestTimer(request);
+
+    if (action === "reject") {
+      request.responseSignal.promise.catch(() => {});
+      request.responseSignal.reject(value);
+      return true;
+    }
+
+    request.responseSignal.resolve(value);
+    return true;
+  }
+
+  async function closeController(cause = null) {
+    if (closed) {
+      return;
+    }
+
+    closed = true;
+    for (const pendingToolRequest of pendingToolRequests.splice(0)) {
+      if (pendingToolRequest.settled) {
+        continue;
+      }
+
+      settlePendingToolRequest(
+        pendingToolRequest,
+        "reject",
+        cause ||
+          new AppError("Codex tool bridge session was closed before the tool result arrived", {
+            status: 499,
+            type: "api_error",
+          }),
+      );
+    }
+    await client.close();
+  }
+
+  function failPendingToolRequest(request, error) {
+    if (!settlePendingToolRequest(request, "reject", error)) {
+      return;
+    }
+
+    queueMicrotask(() => {
+      rejectStop(error);
+      void closeController(error);
+    });
+  }
+
+  function schedulePendingToolRequestTimeout(request) {
+    if (!request || request.settled || !request.emitted || request.timeoutHandle || request.timeoutMs < 1) {
+      return;
+    }
+
+    request.timeoutHandle = setTimeout(() => {
+      request.timeoutHandle = null;
+      const error = new AppError(
+        `Codex native tool '${request.tool || "unknown"}' timed out after ${request.timeoutMs}ms`,
+        {
+          status: 504,
+          type: "api_error",
+        },
+      );
+      logNativeToolBridgeEvent(
+        logger,
+        "Codex native tool timed out",
+        buildPendingToolRequestLogDetails(request),
+        { warn: true },
+      );
+      failPendingToolRequest(request, error);
+    }, request.timeoutMs);
+
+    request.timeoutHandle.unref?.();
+  }
+
   function emitNextPendingToolRequest() {
     const request = currentPendingToolRequest();
     if (!request || request.emitted || completed || closed) {
@@ -1570,6 +1684,13 @@ export async function createAppServerCodexTurnController({
     }
 
     request.emitted = true;
+    request.emittedAt = Date.now();
+    logNativeToolBridgeEvent(
+      logger,
+      "Codex native tool dispatched",
+      buildPendingToolRequestLogDetails(request),
+    );
+    schedulePendingToolRequestTimeout(request);
     resolveStop(buildToolRequestOutcome(request));
     return true;
   }
@@ -1593,6 +1714,11 @@ export async function createAppServerCodexTurnController({
         callId: message.params?.callId,
         tool: message.params?.tool,
         arguments: message.params?.arguments ?? {},
+        emitted: false,
+        emittedAt: null,
+        settled: false,
+        timeoutHandle: null,
+        timeoutMs: nativeToolTimeoutMs,
         responseSignal,
       });
       emitNextPendingToolRequest();
@@ -1741,7 +1867,14 @@ export async function createAppServerCodexTurnController({
       }
 
       stopSignal = createDeferred();
-      activeRequest.responseSignal.resolve(toolResult);
+      settlePendingToolRequest(activeRequest, "resolve", toolResult);
+      logNativeToolBridgeEvent(
+        logger,
+        "Codex native tool result received",
+        buildPendingToolRequestLogDetails(activeRequest, {
+          success: toolResult?.success ?? null,
+        }),
+      );
       queueMicrotask(() => {
         emitNextPendingToolRequest();
       });
@@ -1771,21 +1904,11 @@ export async function createAppServerCodexTurnController({
     isCompleted() {
       return completed;
     },
+    isClosed() {
+      return closed;
+    },
     async close() {
-      if (closed) {
-        return;
-      }
-      closed = true;
-      for (const pendingToolRequest of pendingToolRequests.splice(0)) {
-        pendingToolRequest.responseSignal.promise.catch(() => {});
-        pendingToolRequest.responseSignal.reject(
-          new AppError("Codex tool bridge session was closed before the tool result arrived", {
-            status: 499,
-            type: "api_error",
-          }),
-        );
-      }
-      await client.close();
+      await closeController();
     },
   };
 }
@@ -2249,7 +2372,12 @@ export function createCodexBackend({
 
   function getPendingToolSessions(key) {
     const pendingSessions = pendingToolSessions.get(key);
-    return Array.isArray(pendingSessions) ? pendingSessions : [];
+    const normalizedSessions = Array.isArray(pendingSessions) ? pendingSessions : [];
+    const activeSessions = normalizedSessions.filter(session => !session?.controller?.isClosed?.());
+    if (activeSessions.length !== normalizedSessions.length) {
+      setPendingToolSessions(key, activeSessions);
+    }
+    return activeSessions;
   }
 
   function setPendingToolSessions(key, pendingSessions) {
