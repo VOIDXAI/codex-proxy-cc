@@ -5,6 +5,7 @@ import { DEFAULT_CONFIG } from "../src/config/defaults.mjs";
 import { startGatewayServer } from "../src/gateway/server.mjs";
 import { openSse, writeSseEvent } from "../src/gateway/sse.mjs";
 import { parseSseStream } from "../src/gateway/sse.mjs";
+import { LOCAL_GATEWAY_TOKEN_HEADER } from "../src/shared/local-auth.mjs";
 import { createSseReadable } from "./helpers.mjs";
 
 async function withGateway(backend, fn, config = DEFAULT_CONFIG) {
@@ -112,6 +113,45 @@ test("gateway rejects unauthorized Anthropic requests when bound off-loopback", 
 
       assert.equal(response.status, 401);
       assert.equal(payload.error.type, "authentication_error");
+    },
+    {
+      ...DEFAULT_CONFIG,
+      server: {
+        ...DEFAULT_CONFIG.server,
+        bind: "0.0.0.0",
+      },
+    },
+  );
+});
+
+test("gateway accepts dedicated local auth headers when bound off-loopback", async () => {
+  await withGateway(
+    {
+      kind: "codex-app-server",
+      async countTokens() {
+        return { input_tokens: 0 };
+      },
+      async createMessage() {
+        return { ok: true };
+      },
+      async streamMessage() {},
+    },
+    async gateway => {
+      const response = await fetch(`http://127.0.0.1:${gateway.port}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          [LOCAL_GATEWAY_TOKEN_HEADER]: "local-token",
+          authorization: "Bearer upstream-token",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          messages: [],
+        }),
+      });
+
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), { ok: true });
     },
     {
       ...DEFAULT_CONFIG,

@@ -568,7 +568,7 @@ test("gateway claude mode forwards Anthropic bodies unchanged except proxy-priva
         assert.equal(upstreamRequests[0].headers["anthropic-version"], "2023-06-01");
         assert.equal(upstreamRequests[0].headers["anthropic-beta"], "output-128k-2025-02-19");
         assert.equal(upstreamRequests[0].headers["x-client-request-id"], "req-pass-1");
-        assert.equal(upstreamRequests[0].headers["x-claude-code-session-id"], undefined);
+        assert.equal(upstreamRequests[0].headers["x-claude-code-session-id"], sessionId);
         assert.equal("_codexProxyCc" in upstreamRequests[0].body, false);
         assert.equal("_codexProxyCc" in upstreamRequests[1].body, false);
       },

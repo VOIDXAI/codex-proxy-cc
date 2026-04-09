@@ -1,6 +1,10 @@
 import crypto from "node:crypto";
 
 import { AppError } from "../shared/errors.mjs";
+import {
+  LOCAL_GATEWAY_TOKEN_ENV,
+  LOCAL_GATEWAY_TOKEN_HEADER,
+} from "../shared/local-auth.mjs";
 import { resolveBinaryOnPath } from "../shared/resolve-binary.mjs";
 
 export function parseClaudeLaunchHints(args = []) {
@@ -58,12 +62,22 @@ export function buildClaudeEnv({
   const proxyBypassEnv = loopbackGateway
     ? buildLoopbackProxyBypassEnv(parentEnv)
     : {};
+  const gatewayAuthEnv = shouldInjectGatewayToken
+    ? {
+      [LOCAL_GATEWAY_TOKEN_ENV]: localToken,
+      ANTHROPIC_CUSTOM_HEADERS: upsertCustomHeader(
+        parentEnv.ANTHROPIC_CUSTOM_HEADERS,
+        LOCAL_GATEWAY_TOKEN_HEADER,
+        localToken,
+      ),
+    }
+    : {};
 
   return {
     ...parentEnv,
     ANTHROPIC_BASE_URL: gatewayUrl,
     ...proxyBypassEnv,
-    ...(shouldInjectGatewayToken ? { ANTHROPIC_AUTH_TOKEN: localToken } : {}),
+    ...gatewayAuthEnv,
     ...(cliBinaryPath ? { CODEX_PROXY_CC_BIN: cliBinaryPath } : {}),
     ...(config.claude?.effortLevel && config.claude.effortLevel !== "inherit"
       ? { CLAUDE_CODE_EFFORT_LEVEL: config.claude.effortLevel }
@@ -75,6 +89,40 @@ export function buildClaudeEnv({
     ...(config.privacy.disableErrorReporting ? { DISABLE_ERROR_REPORTING: "1" } : {}),
     ...(config.privacy.disableFeedbackCommand ? { DISABLE_FEEDBACK_COMMAND: "1" } : {}),
   };
+}
+
+function upsertCustomHeader(existingHeaders, name, value) {
+  const lines = String(existingHeaders || "")
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+  const output = [];
+  let replaced = false;
+
+  for (const line of lines) {
+    const separator = line.indexOf(":");
+    if (separator === -1) {
+      output.push(line);
+      continue;
+    }
+
+    const currentName = line.slice(0, separator).trim();
+    if (currentName.toLowerCase() === name.toLowerCase()) {
+      if (!replaced) {
+        output.push(`${name}: ${value}`);
+        replaced = true;
+      }
+      continue;
+    }
+
+    output.push(line);
+  }
+
+  if (!replaced) {
+    output.push(`${name}: ${value}`);
+  }
+
+  return output.join("\n");
 }
 
 function buildLoopbackProxyBypassEnv(parentEnv) {

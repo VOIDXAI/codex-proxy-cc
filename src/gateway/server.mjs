@@ -5,8 +5,13 @@ import { createGatewayBackend } from "../backends/create-backend.mjs";
 import { resolveRouteStatus } from "../route/status.mjs";
 import { AppError } from "../shared/errors.mjs";
 import { readJsonBody, writeAnthropicError, writeJson } from "../shared/http.mjs";
+import { LOCAL_GATEWAY_TOKEN_HEADER } from "../shared/local-auth.mjs";
 
 function normalizeAuthToken(headers) {
+  const localHeaderToken = readHeaderValue(headers, LOCAL_GATEWAY_TOKEN_HEADER);
+  if (localHeaderToken) {
+    return localHeaderToken;
+  }
   const authorization = headers.authorization;
   if (typeof authorization === "string" && authorization.toLowerCase().startsWith("bearer ")) {
     return authorization.slice(7).trim();

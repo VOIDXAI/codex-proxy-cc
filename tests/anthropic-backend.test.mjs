@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 
 import { createAnthropicBackend } from "../src/backends/anthropic-backend.mjs";
+import { LOCAL_GATEWAY_TOKEN_HEADER } from "../src/shared/local-auth.mjs";
 import { createCaptureResponse } from "./helpers.mjs";
 
 async function withHttpServer(handler, fn) {
@@ -22,7 +23,7 @@ async function withHttpServer(handler, fn) {
   }
 }
 
-test("anthropic backend forwards JSON requests and auth headers", async () => {
+test("anthropic backend forwards JSON requests and preserves Claude request headers", async () => {
   const requests = [];
 
   await withHttpServer(async (req, res) => {
@@ -51,7 +52,13 @@ test("anthropic backend forwards JSON requests and auth headers", async () => {
         requestHeaders: {
           authorization: "Bearer upstream-token",
           "anthropic-version": "2023-06-01",
+          "anthropic-beta": "oauth-2025-04-20",
           "x-client-request-id": "req-123",
+          "x-app": "cli",
+          "user-agent": "Claude-Code/Test",
+          "x-claude-code-session-id": "session-123",
+          [LOCAL_GATEWAY_TOKEN_HEADER]: "local-token",
+          connection: "keep-alive",
         },
       },
     );
@@ -61,7 +68,12 @@ test("anthropic backend forwards JSON requests and auth headers", async () => {
     assert.equal(requests[0].url, "/v1/messages/count_tokens");
     assert.equal(requests[0].headers.authorization, "Bearer upstream-token");
     assert.equal(requests[0].headers["anthropic-version"], "2023-06-01");
+    assert.equal(requests[0].headers["anthropic-beta"], "oauth-2025-04-20");
     assert.equal(requests[0].headers["x-client-request-id"], "req-123");
+    assert.equal(requests[0].headers["x-app"], "cli");
+    assert.equal(requests[0].headers["user-agent"], "Claude-Code/Test");
+    assert.equal(requests[0].headers["x-claude-code-session-id"], "session-123");
+    assert.equal(requests[0].headers[LOCAL_GATEWAY_TOKEN_HEADER], undefined);
     assert.equal(requests[0].body.model, "claude-sonnet-4-6");
   });
 });

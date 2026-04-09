@@ -2,12 +2,24 @@ import http from "node:http";
 import https from "node:https";
 
 import { AppError, mapHttpStatusToAnthropicType } from "../shared/errors.mjs";
+import {
+  LOCAL_GATEWAY_TOKEN_ENV,
+  LOCAL_GATEWAY_TOKEN_HEADER,
+} from "../shared/local-auth.mjs";
 
 function buildControlHeaders(env = process.env) {
   const headers = {
     accept: "application/json",
     connection: "close",
   };
+
+  const localToken = typeof env[LOCAL_GATEWAY_TOKEN_ENV] === "string"
+    ? env[LOCAL_GATEWAY_TOKEN_ENV].trim()
+    : "";
+  if (localToken) {
+    headers[LOCAL_GATEWAY_TOKEN_HEADER] = localToken;
+    return headers;
+  }
 
   const authToken = typeof env.ANTHROPIC_AUTH_TOKEN === "string" ? env.ANTHROPIC_AUTH_TOKEN.trim() : "";
   if (authToken) {

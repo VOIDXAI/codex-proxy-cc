@@ -1,31 +1,46 @@
 import { AppError, mapHttpStatusToAnthropicType } from "../shared/errors.mjs";
+import { LOCAL_GATEWAY_TOKEN_HEADER } from "../shared/local-auth.mjs";
 
-const FORWARDED_HEADERS = [
-  "authorization",
-  "x-api-key",
-  "anthropic-version",
-  "anthropic-beta",
-  "x-client-request-id",
-];
-
-function getHeaderValue(headers, name) {
-  const value = headers?.[name];
-  if (Array.isArray(value)) {
-    return value.find(item => typeof item === "string" && item.trim()) || null;
-  }
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
+const BLOCKED_HEADERS = new Set([
+  "host",
+  "content-length",
+  "connection",
+  "proxy-connection",
+  "keep-alive",
+  "transfer-encoding",
+  "upgrade",
+  "te",
+  "trailer",
+  LOCAL_GATEWAY_TOKEN_HEADER,
+]);
 
 function buildForwardHeaders(requestHeaders = {}) {
-  const headers = {
-    "content-type": "application/json",
-  };
+  const headers = {};
 
-  for (const name of FORWARDED_HEADERS) {
-    const value = getHeaderValue(requestHeaders, name);
+  for (const [rawName, rawValue] of Object.entries(requestHeaders || {})) {
+    const name = String(rawName || "").toLowerCase();
+    if (!name || BLOCKED_HEADERS.has(name)) {
+      continue;
+    }
+
+    if (Array.isArray(rawValue)) {
+      const values = rawValue
+        .map(value => String(value || "").trim())
+        .filter(Boolean);
+      if (values.length > 0) {
+        headers[name] = values.join(", ");
+      }
+      continue;
+    }
+
+    const value = typeof rawValue === "string" ? rawValue.trim() : "";
     if (value) {
       headers[name] = value;
     }
+  }
+
+  if (!headers["content-type"]) {
+    headers["content-type"] = "application/json";
   }
 
   return headers;

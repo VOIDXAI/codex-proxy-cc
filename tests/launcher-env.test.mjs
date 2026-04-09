@@ -13,6 +13,10 @@ import {
   isLoopbackGatewayUrl,
   parseClaudeLaunchHints,
 } from "../src/launcher/env.mjs";
+import {
+  LOCAL_GATEWAY_TOKEN_ENV,
+  LOCAL_GATEWAY_TOKEN_HEADER,
+} from "../src/shared/local-auth.mjs";
 
 test("buildClaudeEnv injects gateway settings and privacy toggles", () => {
   const env = buildClaudeEnv({
@@ -93,17 +97,24 @@ test("buildClaudeEnv can pin Claude effort environment overrides", () => {
   assert.equal(env.CLAUDE_CODE_EFFORT_LEVEL, "unset");
 });
 
-test("buildClaudeEnv still injects a gateway auth token for non-loopback proxies", () => {
+test("buildClaudeEnv injects a dedicated local gateway auth header for non-loopback proxies", () => {
   const env = buildClaudeEnv({
     parentEnv: {
       PATH: process.env.PATH || "",
+      ANTHROPIC_AUTH_TOKEN: "upstream-auth-token",
+      ANTHROPIC_CUSTOM_HEADERS: "x-existing: keep-me",
     },
     gatewayUrl: "http://192.168.1.20:43123",
     localToken: "token-123",
     config: DEFAULT_CONFIG,
   });
 
-  assert.equal(env.ANTHROPIC_AUTH_TOKEN, "token-123");
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, "upstream-auth-token");
+  assert.equal(env[LOCAL_GATEWAY_TOKEN_ENV], "token-123");
+  assert.equal(
+    env.ANTHROPIC_CUSTOM_HEADERS,
+    `x-existing: keep-me\n${LOCAL_GATEWAY_TOKEN_HEADER}: token-123`,
+  );
 });
 
 test("buildClaudeEnv bypasses HTTP proxies for loopback gateways", () => {
