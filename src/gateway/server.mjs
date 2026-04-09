@@ -109,24 +109,62 @@ function logClaudePassthroughRouting(logger, body, options = {}) {
   });
 }
 
+function createRequestAbortController(req, res) {
+  const controller = new AbortController();
+
+  function abortRequest(message) {
+    if (controller.signal.aborted) {
+      return;
+    }
+    controller.abort(
+      new AppError(message, {
+        status: 499,
+        type: "api_error",
+      }),
+    );
+  }
+
+  const handleRequestAborted = () => {
+    abortRequest("Anthropic client closed the request before the response completed");
+  };
+  const handleResponseClose = () => {
+    if (!res.writableEnded) {
+      abortRequest("Anthropic client disconnected before the response completed");
+    }
+  };
+
+  req.on("aborted", handleRequestAborted);
+  res.on("close", handleResponseClose);
+
+  return {
+    signal: controller.signal,
+    cleanup() {
+      req.off("aborted", handleRequestAborted);
+      res.off("close", handleResponseClose);
+    },
+  };
+}
+
 export function createGatewayHandler({
   config,
   logger,
   localToken,
   backend,
+  codexBackend = null,
   claudeBackend,
+  nativeBackend = null,
   sessionStore,
   projectRoot = process.cwd(),
   env = process.env,
   nativeAnthropicBaseUrl = process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com",
 }) {
-  const codexBackend = createGatewayBackend({
+  const resolvedCodexBackend = codexBackend || createGatewayBackend({
     config,
     logger,
     backend,
     sessionStore,
   });
-  const nativeBackend = claudeBackend || createAnthropicBackend({
+  const resolvedNativeBackend = nativeBackend || claudeBackend || createAnthropicBackend({
     baseUrl: nativeAnthropicBaseUrl,
   });
   const sessionModes = new Map();
@@ -135,6 +173,7 @@ export function createGatewayHandler({
 
   return async function gatewayHandler(req, res) {
     const url = parseRequestedUrl(req);
+    const requestAbort = createRequestAbortController(req, res);
 
     try {
       if (url.pathname === "/" && req.method === "HEAD") {
@@ -146,7 +185,7 @@ export function createGatewayHandler({
       if (url.pathname === "/" && req.method === "GET") {
         writeJson(res, 200, {
           ok: true,
-          provider: codexBackend.kind,
+          provider: resolvedCodexBackend.kind,
         });
         return;
       }
@@ -154,7 +193,7 @@ export function createGatewayHandler({
       if (url.pathname === "/healthz" && req.method === "GET") {
         writeJson(res, 200, {
           ok: true,
-          provider: codexBackend.kind,
+          provider: resolvedCodexBackend.kind,
         });
         return;
       }
@@ -229,11 +268,12 @@ export function createGatewayHandler({
         const body = attachProxyContext(await readJsonBody(req), req.headers);
         const backendForRequest =
           getSessionMode(sessionModes, body?._codexProxyCc?.sessionId) === "claude"
-            ? nativeBackend
-            : codexBackend;
+            ? resolvedNativeBackend
+            : resolvedCodexBackend;
         const tokenCounts = await backendForRequest.countTokens(body, {
           requestHeaders: req.headers,
           requestUrl: req.url,
+          abortSignal: requestAbort.signal,
         });
         writeJson(res, 200, {
           input_tokens: tokenCounts.input_tokens,
@@ -244,7 +284,7 @@ export function createGatewayHandler({
       if (url.pathname === "/v1/messages" && req.method === "POST") {
         const body = attachProxyContext(await readJsonBody(req), req.headers);
         const routeMode = getSessionMode(sessionModes, body?._codexProxyCc?.sessionId);
-        const backendForRequest = routeMode === "claude" ? nativeBackend : codexBackend;
+        const backendForRequest = routeMode === "claude" ? resolvedNativeBackend : resolvedCodexBackend;
 
         if (routeMode === "claude") {
           logClaudePassthroughRouting(logger, body, {
@@ -256,6 +296,7 @@ export function createGatewayHandler({
           await backendForRequest.streamMessage(body, res, {
             requestHeaders: req.headers,
             requestUrl: req.url,
+            abortSignal: requestAbort.signal,
           });
           return;
         }
@@ -263,6 +304,7 @@ export function createGatewayHandler({
         const anthropicResponse = await backendForRequest.createMessage(body, {
           requestHeaders: req.headers,
           requestUrl: req.url,
+          abortSignal: requestAbort.signal,
         });
         writeJson(res, 200, anthropicResponse);
         return;
@@ -273,12 +315,25 @@ export function createGatewayHandler({
         type: "not_found_error",
       });
     } catch (error) {
+      if (requestAbort.signal.aborted) {
+        logger?.debug?.("Gateway request aborted", {
+          method: req.method,
+          path: url.pathname,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
       logger?.warn?.("Gateway request failed", {
         method: req.method,
         path: url.pathname,
         error: error instanceof Error ? error.message : String(error),
       });
+      if (res.destroyed || res.writableEnded) {
+        return;
+      }
       writeAnthropicError(res, error);
+    } finally {
+      requestAbort.cleanup();
     }
   };
 }
@@ -294,12 +349,23 @@ export async function startGatewayServer({
   env = process.env,
   nativeAnthropicBaseUrl = process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com",
 }) {
+  const resolvedCodexBackend = backend || createGatewayBackend({
+    config,
+    logger,
+    backend,
+    sessionStore,
+  });
+  const resolvedNativeBackend = claudeBackend || createAnthropicBackend({
+    baseUrl: nativeAnthropicBaseUrl,
+  });
   const handler = createGatewayHandler({
     config,
     logger,
     localToken,
     backend,
+    codexBackend: resolvedCodexBackend,
     claudeBackend,
+    nativeBackend: resolvedNativeBackend,
     sessionStore,
     projectRoot,
     env,
@@ -335,6 +401,10 @@ export async function startGatewayServer({
         socket.destroy();
       }
       await new Promise(resolve => server.close(resolve));
+      await Promise.allSettled([
+        resolvedCodexBackend?.close?.(),
+        resolvedNativeBackend?.close?.(),
+      ]);
     },
   };
 }

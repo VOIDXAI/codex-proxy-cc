@@ -1,3 +1,4 @@
+import http from "node:http";
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -53,6 +54,39 @@ test("gateway serves healthz without auth", async () => {
       });
     },
   );
+});
+
+test("gateway.close shuts down the configured backend", async () => {
+  let closeCalls = 0;
+  const gateway = await startGatewayServer({
+    config: DEFAULT_CONFIG,
+    logger: {
+      debug() {},
+      info() {},
+      warn() {},
+      error() {},
+    },
+    localToken: "local-token",
+    backend: {
+      kind: "codex-app-server",
+      async countTokens() {
+        throw new Error("not used");
+      },
+      async createMessage() {
+        throw new Error("not used");
+      },
+      async streamMessage() {
+        throw new Error("not used");
+      },
+      async close() {
+        closeCalls += 1;
+      },
+    },
+  });
+
+  await gateway.close();
+
+  assert.equal(closeCalls, 1);
 });
 
 test("gateway allows unauthenticated loopback Anthropic requests", async () => {
@@ -356,5 +390,94 @@ test("gateway proxies streaming Anthropic SSE from the selected backend", async 
     );
     assert.equal(events[2].data.delta.text, "streamed text");
     assert.equal(events[4].data.usage.input_tokens, 4);
+  });
+});
+
+test("gateway aborts backend streaming requests when the client disconnects", async () => {
+  let seenAbortSignal = null;
+  let abortReason = null;
+  let resolveAbort;
+  const aborted = new Promise(resolve => {
+    resolveAbort = resolve;
+  });
+  const backend = {
+    kind: "codex-app-server",
+    async countTokens() {
+      throw new Error("not used");
+    },
+    async createMessage() {
+      throw new Error("not used");
+    },
+    async streamMessage(body, res, context = {}) {
+      seenAbortSignal = context.abortSignal;
+      if (context.abortSignal?.aborted) {
+        abortReason = context.abortSignal.reason;
+        resolveAbort();
+        return;
+      }
+
+      await new Promise(resolve => {
+        context.abortSignal?.addEventListener(
+          "abort",
+          () => {
+            abortReason = context.abortSignal.reason;
+            resolveAbort();
+            resolve();
+          },
+          { once: true },
+        );
+      });
+    },
+  };
+
+  await withGateway(backend, async gateway => {
+    await new Promise((resolve, reject) => {
+      const req = http.request(`${gateway.url}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer local-token",
+        },
+      });
+
+      let settled = false;
+      const finish = error => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      };
+
+      req.on("error", error => {
+        if (error?.code === "ECONNRESET" || /socket hang up/i.test(error?.message || "")) {
+          finish();
+          return;
+        }
+        finish(error);
+      });
+
+      req.end(
+        JSON.stringify({
+          model: "claude-sonnet-4-6",
+          stream: true,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      );
+
+      setTimeout(() => {
+        req.destroy();
+        finish();
+      }, 30).unref?.();
+    });
+
+    await aborted;
+    assert.equal(seenAbortSignal?.aborted, true);
+    assert.ok(abortReason instanceof Error);
+    assert.match(abortReason.message, /disconnect|closed/i);
   });
 });

@@ -5,6 +5,7 @@ import {
   buildCodexAppServerCapabilities,
   createAppServerCodexTurnController,
   createCodexBackend,
+  runCodexTurn,
 } from "../src/backends/codex-backend.mjs";
 import { DEFAULT_CONFIG } from "../src/config/defaults.mjs";
 import { parseSseStream } from "../src/gateway/sse.mjs";
@@ -481,6 +482,128 @@ test("app-server turn controller times out stalled native tool calls and logs a 
   await controller.close();
 });
 
+test("app-server turn controller aborts when the Anthropic client disconnects", async () => {
+  const abortController = new AbortController();
+  let closeCalls = 0;
+  let resolveExit;
+  const fakeClient = {
+    stderr: "",
+    exitError: null,
+    exitPromise: new Promise(resolve => {
+      resolveExit = resolve;
+    }),
+    setServerRequestHandler() {},
+    setNotificationHandler() {},
+    async request(method) {
+      switch (method) {
+        case "thread/start":
+          return {
+            thread: {
+              id: "thread_abort",
+              path: "/tmp/thread-abort.json",
+            },
+          };
+        case "turn/start":
+          return {
+            turn: {
+              id: "turn_abort",
+            },
+          };
+        default:
+          throw new Error(`Unexpected app-server request: ${method}`);
+      }
+    },
+    async close() {
+      closeCalls += 1;
+      resolveExit();
+    },
+  };
+
+  const controller = await createAppServerCodexTurnController({
+    config: DEFAULT_CONFIG,
+    logger: null,
+    prompt: "Plan the implementation.",
+    model: "gpt-5.4",
+    effort: "medium",
+    cwd: process.cwd(),
+    outputSchema: null,
+    summary: "none",
+    abortSignal: abortController.signal,
+    connectAppServer: async () => fakeClient,
+  });
+
+  const outcomePromise = controller.waitForStop();
+  abortController.abort(
+    new AppError("Anthropic client disconnected before the response completed", {
+      status: 499,
+      type: "api_error",
+    }),
+  );
+
+  await assert.rejects(outcomePromise, /Anthropic client disconnected/i);
+  assert.equal(controller.isClosed(), true);
+  assert.equal(closeCalls, 1);
+
+  await controller.close();
+});
+
+test("runCodexTurn rejects when codex app-server exits before turn completion", async () => {
+  let closeCalls = 0;
+  let resolveExit;
+  const fakeClient = {
+    stderr: "",
+    exitError: null,
+    exitPromise: new Promise(resolve => {
+      resolveExit = resolve;
+    }),
+    setNotificationHandler() {},
+    async request(method) {
+      switch (method) {
+        case "thread/start":
+          return {
+            thread: {
+              id: "thread_exit_early",
+              path: "/tmp/thread-exit-early.json",
+            },
+          };
+        case "turn/start":
+          queueMicrotask(() => {
+            resolveExit();
+          });
+          return {
+            turn: {
+              id: "turn_exit_early",
+            },
+          };
+        default:
+          throw new Error(`Unexpected app-server request: ${method}`);
+      }
+    },
+    async close() {
+      closeCalls += 1;
+      resolveExit();
+    },
+  };
+
+  await assert.rejects(
+    runCodexTurn({
+      config: DEFAULT_CONFIG,
+      logger: null,
+      prompt: "Plan the implementation.",
+      turnInput: [{ type: "text", text: "Plan the implementation." }],
+      model: "gpt-5.4",
+      effort: "medium",
+      cwd: process.cwd(),
+      outputSchema: null,
+      summary: "none",
+      connectAppServer: async () => fakeClient,
+    }),
+    /connection closed before the turn completed/i,
+  );
+
+  assert.equal(closeCalls, 1);
+});
+
 test("buildCodexAppServerCapabilities enables experimental API for direct turns", () => {
   assert.deepEqual(buildCodexAppServerCapabilities(), {
     experimentalApi: true,
@@ -725,6 +848,140 @@ test("codex backend bridges native Anthropic tools through Codex dynamic tool ca
       success: true,
     },
   ]);
+  assert.equal(harness.controllers[0].closed, true);
+});
+
+test("codex backend sanitizes ExitPlanMode allowedPrompts before returning tool_use", async () => {
+  const harness = createTurnControllerHarness([
+    {
+      model: "gpt-5.4",
+      outcomes: [
+        {
+          value: {
+            type: "tool_request",
+            toolCall: {
+              id: "call_exit_plan_1",
+              name: "ExitPlanMode",
+              input: {
+                plan: "Ship the feature",
+                allowedPrompts: [
+                  { tool: "Edit", prompt: "edit source files" },
+                  { tool: "Write", prompt: "write test fixtures" },
+                  { tool: "Bash", prompt: "run focused tests" },
+                ],
+              },
+            },
+            usage: {
+              input_tokens: 12,
+              output_tokens: 4,
+            },
+          },
+        },
+      ],
+    },
+  ]);
+  const backend = createCodexBackend({
+    config: DEFAULT_CONFIG,
+    logger: null,
+    createTurnController: harness.createTurnController,
+  });
+
+  const response = await backend.createMessage({
+    model: "sonnet",
+    _codexProxyCc: {
+      sessionId: "native-tool-session-exit-plan",
+    },
+    messages: [{ role: "user", content: "Exit plan mode and start coding." }],
+    tools: [
+      {
+        name: "ExitPlanMode",
+        description: "Prompts the user to exit plan mode and start coding",
+        input_schema: {
+          type: "object",
+          properties: {
+            allowedPrompts: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  tool: {
+                    type: "string",
+                    enum: ["Bash"],
+                  },
+                  prompt: {
+                    type: "string",
+                  },
+                },
+                required: ["tool", "prompt"],
+              },
+            },
+          },
+          additionalProperties: true,
+        },
+      },
+    ],
+  });
+
+  assert.equal(response.stop_reason, "tool_use");
+  assert.deepEqual(response.content[0].input.allowedPrompts, [
+    { tool: "Bash", prompt: "run focused tests" },
+  ]);
+});
+
+test("codex backend closes pending native tool sessions when the backend shuts down", async () => {
+  const harness = createTurnControllerHarness([
+    {
+      model: "gpt-5.4",
+      outcomes: [
+        {
+          value: {
+            type: "tool_request",
+            toolCall: {
+              id: "call_close_pending_1",
+              name: "Read",
+              input: { file_path: "README.md" },
+            },
+            usage: {
+              input_tokens: 9,
+              output_tokens: 2,
+            },
+          },
+        },
+      ],
+    },
+  ]);
+  const backend = createCodexBackend({
+    config: DEFAULT_CONFIG,
+    logger: null,
+    createTurnController: harness.createTurnController,
+  });
+
+  const response = await backend.createMessage({
+    model: "sonnet",
+    _codexProxyCc: {
+      sessionId: "native-tool-session-close",
+    },
+    messages: [{ role: "user", content: "Read the README." }],
+    tools: [
+      {
+        name: "Read",
+        description: "Read a file from the workspace",
+        input_schema: {
+          type: "object",
+          properties: {
+            file_path: { type: "string" },
+          },
+          required: ["file_path"],
+        },
+      },
+    ],
+  });
+
+  assert.equal(response.stop_reason, "tool_use");
+  assert.equal(harness.controllers[0].closed, false);
+
+  await backend.close();
+
   assert.equal(harness.controllers[0].closed, true);
 });
 

@@ -690,7 +690,54 @@ function resolveOriginalToolName(toolName, registeredToOriginalName = new Map())
   return registeredToOriginalName.get(toolName) || toolName;
 }
 
+function findNativeAnthropicToolSchema(tools = [], toolName) {
+  if (!toolName) {
+    return null;
+  }
+
+  return filterNativeAnthropicTools(tools).find(tool => tool?.name === toolName)?.input_schema || null;
+}
+
+function sanitizeExitPlanModeAllowedPrompts(allowedPrompts = []) {
+  if (!Array.isArray(allowedPrompts)) {
+    return undefined;
+  }
+
+  const sanitized = allowedPrompts
+    .filter(entry => entry && typeof entry === "object" && typeof entry.prompt === "string")
+    .filter(entry => entry.tool === "Bash")
+    .map(entry => ({
+      tool: "Bash",
+      prompt: entry.prompt,
+    }));
+
+  return sanitized.length > 0 ? sanitized : undefined;
+}
+
+function sanitizeAnthropicToolUseInput(toolName, input, _inputSchema = null) {
+  const normalizedInput =
+    input && typeof input === "object" && !Array.isArray(input)
+      ? { ...input }
+      : input ?? {};
+
+  if (!normalizedInput || typeof normalizedInput !== "object" || Array.isArray(normalizedInput)) {
+    return normalizedInput;
+  }
+
+  if (toolName === "ExitPlanMode" && "allowedPrompts" in normalizedInput) {
+    const allowedPrompts = sanitizeExitPlanModeAllowedPrompts(normalizedInput.allowedPrompts);
+    if (allowedPrompts) {
+      normalizedInput.allowedPrompts = allowedPrompts;
+    } else {
+      delete normalizedInput.allowedPrompts;
+    }
+  }
+
+  return normalizedInput;
+}
+
 function buildAnthropicToolUseResponse(toolName, input, externalModel, usage = {}, options = {}) {
+  const sanitizedInput = sanitizeAnthropicToolUseInput(toolName, input, options.inputSchema);
   return {
     id: `msg_${crypto.randomUUID()}`,
     type: "message",
@@ -701,14 +748,14 @@ function buildAnthropicToolUseResponse(toolName, input, externalModel, usage = {
         type: "tool_use",
         id: options.toolUseId || `toolu_${crypto.randomUUID()}`,
         name: toolName,
-        input,
+        input: sanitizedInput,
       },
     ],
     stop_reason: "tool_use",
     stop_sequence: null,
     usage: {
       input_tokens: usage.input_tokens ?? 0,
-      output_tokens: usage.output_tokens ?? approximateTokensFromText(JSON.stringify(input)),
+      output_tokens: usage.output_tokens ?? approximateTokensFromText(JSON.stringify(sanitizedInput)),
     },
   };
 }
@@ -1071,6 +1118,72 @@ function createDeferred() {
   return { promise, resolve, reject };
 }
 
+function buildCodexClientAbortError(signal, fallbackMessage = "Codex turn was cancelled because the client disconnected") {
+  const reason = signal?.reason;
+  if (reason instanceof AppError) {
+    return reason;
+  }
+  if (reason instanceof Error) {
+    return reason;
+  }
+  if (typeof reason === "string" && reason.trim()) {
+    return new AppError(reason.trim(), {
+      status: 499,
+      type: "api_error",
+    });
+  }
+  return new AppError(fallbackMessage, {
+    status: 499,
+    type: "api_error",
+  });
+}
+
+function buildCodexAppServerClosedError(client, fallbackMessage = "Codex app-server connection closed before the turn completed") {
+  if (client?.exitError instanceof Error) {
+    return client.exitError;
+  }
+  return new AppError(fallbackMessage, {
+    status: 502,
+    type: "api_error",
+  });
+}
+
+function observeAbortSignal(signal, onAbort) {
+  if (!signal || typeof onAbort !== "function") {
+    return () => {};
+  }
+
+  if (signal.aborted) {
+    onAbort();
+    return () => {};
+  }
+
+  const handler = () => {
+    onAbort();
+  };
+  signal.addEventListener("abort", handler, { once: true });
+  return () => {
+    signal.removeEventListener("abort", handler);
+  };
+}
+
+function observeClientExit(client, onExit) {
+  if (!client?.exitPromise || typeof client.exitPromise.then !== "function" || typeof onExit !== "function") {
+    return () => {};
+  }
+
+  let active = true;
+  client.exitPromise.then(() => {
+    if (!active) {
+      return;
+    }
+    onExit();
+  });
+  return () => {
+    active = false;
+  };
+}
+
 function createCodexTurnAccumulator({ onEvent } = {}) {
   const agentMessages = new Map();
   const planMessages = new Map();
@@ -1324,7 +1437,7 @@ function createCodexTurnAccumulator({ onEvent } = {}) {
   };
 }
 
-async function runCodexTurn({
+export async function runCodexTurn({
   config,
   logger,
   prompt,
@@ -1336,8 +1449,10 @@ async function runCodexTurn({
   summary = "none",
   onEvent,
   threadContext,
+  abortSignal,
+  connectAppServer = connectCodexAppServer,
 }) {
-  const client = await connectCodexAppServer(cwd, {
+  const client = await connectAppServer(cwd, {
     command: config.codex.binary,
     env: process.env,
     capabilities: buildCodexAppServerCapabilities(),
@@ -1352,11 +1467,39 @@ async function runCodexTurn({
     output_tokens: 0,
   };
   const accumulator = createCodexTurnAccumulator({ onEvent });
+  let cleanupAbortWatcher = () => {};
+  let cleanupExitWatcher = () => {};
 
   try {
     const sandbox = config.codex.sandbox || "workspace-write";
     const resumeThreadId = threadContext?.threadId || threadContext?.resumeThreadId;
     const resumeThreadPath = threadContext?.threadPath || threadContext?.resumeThreadPath;
+
+    const completion = createDeferred();
+    completion.promise.catch(() => {});
+    let completionSettled = false;
+    const resolveCompletion = payload => {
+      if (completionSettled) {
+        return;
+      }
+      completionSettled = true;
+      completion.resolve(payload);
+    };
+    const rejectCompletion = error => {
+      if (completionSettled) {
+        return;
+      }
+      completionSettled = true;
+      completion.reject(error);
+    };
+
+    cleanupAbortWatcher = observeAbortSignal(abortSignal, () => {
+      rejectCompletion(buildCodexClientAbortError(abortSignal));
+      void client.close();
+    });
+    cleanupExitWatcher = observeClientExit(client, () => {
+      rejectCompletion(buildCodexAppServerClosedError(client));
+    });
 
     if (resumeThreadId || resumeThreadPath) {
       const threadResume = await client.request("thread/resume", {
@@ -1386,77 +1529,75 @@ async function runCodexTurn({
       threadPath = threadStart.thread?.path || null;
     }
 
-    const completion = new Promise((resolve, reject) => {
-      client.setNotificationHandler(message => {
-        try {
-          switch (message.method) {
-            case "item/started":
-              accumulator.noteStartedItem(message.params?.item);
-              break;
-            case "item/agentMessage/delta":
-              accumulator.noteAgentMessageDelta({
-                itemId: message.params?.itemId,
-                delta: message.params?.delta || "",
-              });
-              break;
-            case "item/plan/delta":
-              accumulator.notePlanDelta({
-                itemId: message.params?.itemId,
-                delta: message.params?.delta || "",
-              });
-              break;
-            case "item/reasoning/summaryPartAdded":
-              accumulator.noteReasoningSummaryPart({
-                itemId: message.params?.itemId,
-                summaryIndex: message.params?.summaryIndex ?? 0,
-              });
-              break;
-            case "item/reasoning/summaryTextDelta":
-              accumulator.noteReasoningSummaryDelta({
-                itemId: message.params?.itemId,
-                summaryIndex: message.params?.summaryIndex ?? 0,
-                delta: message.params?.delta || "",
-              });
-              break;
-            case "item/reasoning/textDelta":
-              accumulator.noteReasoningTextDelta({
-                itemId: message.params?.itemId,
-                delta: message.params?.delta || "",
-              });
-              break;
-            case "item/completed":
-              accumulator.noteCompletedItem(message.params?.item);
-              break;
-            case "thread/tokenUsage/updated": {
-              const tokenUsage = message.params?.tokenUsage?.last || message.params?.tokenUsage?.total;
-              if (tokenUsage) {
-                usage = {
-                  input_tokens: tokenUsage.inputTokens ?? usage.input_tokens,
-                  output_tokens: tokenUsage.outputTokens ?? usage.output_tokens,
-                };
-              }
-              break;
+    client.setNotificationHandler(message => {
+      try {
+        switch (message.method) {
+          case "item/started":
+            accumulator.noteStartedItem(message.params?.item);
+            break;
+          case "item/agentMessage/delta":
+            accumulator.noteAgentMessageDelta({
+              itemId: message.params?.itemId,
+              delta: message.params?.delta || "",
+            });
+            break;
+          case "item/plan/delta":
+            accumulator.notePlanDelta({
+              itemId: message.params?.itemId,
+              delta: message.params?.delta || "",
+            });
+            break;
+          case "item/reasoning/summaryPartAdded":
+            accumulator.noteReasoningSummaryPart({
+              itemId: message.params?.itemId,
+              summaryIndex: message.params?.summaryIndex ?? 0,
+            });
+            break;
+          case "item/reasoning/summaryTextDelta":
+            accumulator.noteReasoningSummaryDelta({
+              itemId: message.params?.itemId,
+              summaryIndex: message.params?.summaryIndex ?? 0,
+              delta: message.params?.delta || "",
+            });
+            break;
+          case "item/reasoning/textDelta":
+            accumulator.noteReasoningTextDelta({
+              itemId: message.params?.itemId,
+              delta: message.params?.delta || "",
+            });
+            break;
+          case "item/completed":
+            accumulator.noteCompletedItem(message.params?.item);
+            break;
+          case "thread/tokenUsage/updated": {
+            const tokenUsage = message.params?.tokenUsage?.last || message.params?.tokenUsage?.total;
+            if (tokenUsage) {
+              usage = {
+                input_tokens: tokenUsage.inputTokens ?? usage.input_tokens,
+                output_tokens: tokenUsage.outputTokens ?? usage.output_tokens,
+              };
             }
-            case "error":
-              reject(
-                new AppError(message.params?.error?.message || "Codex app-server turn failed", {
-                  status: 502,
-                  type: "api_error",
-                }),
-              );
-              break;
-            case "turn/completed":
-              resolve({
-                turn: message.params?.turn || null,
-              });
-              break;
-            default:
-              break;
+            break;
           }
-        } catch (error) {
-          reject(error);
+          case "error":
+            rejectCompletion(
+              new AppError(message.params?.error?.message || "Codex app-server turn failed", {
+                status: 502,
+                type: "api_error",
+              }),
+            );
+            break;
+          case "turn/completed":
+            resolveCompletion({
+              turn: message.params?.turn || null,
+            });
+            break;
+          default:
+            break;
         }
-      });
+      } catch (error) {
+        rejectCompletion(error);
+      }
     });
 
     const turnStart = await client.request("turn/start", {
@@ -1469,7 +1610,7 @@ async function runCodexTurn({
     });
     turnId = turnStart.turn?.id || null;
 
-    const { turn } = await completion;
+    const { turn } = await completion.promise;
     if (turn?.status && turn.status !== "completed") {
       throw new AppError(`Codex turn ended with status '${turn.status}'`, {
         status: 502,
@@ -1496,6 +1637,8 @@ async function runCodexTurn({
       stderr: client.stderr,
     });
   } finally {
+    cleanupAbortWatcher();
+    cleanupExitWatcher();
     await client.close();
   }
 }
@@ -1515,6 +1658,7 @@ export async function createAppServerCodexTurnController({
   dynamicTools = [],
   registeredToOriginalToolName = new Map(),
   connectAppServer = connectCodexAppServer,
+  abortSignal,
 }) {
   const client = await connectAppServer(cwd, {
     command: config.codex.binary,
@@ -1544,7 +1688,10 @@ export async function createAppServerCodexTurnController({
     },
   });
   let stopSignal = createDeferred();
+  stopSignal.promise.catch(() => {});
   const pendingToolRequests = [];
+  let cleanupAbortWatcher = () => {};
+  let cleanupExitWatcher = () => {};
 
   function resolveStop(payload) {
     stopSignal.resolve(payload);
@@ -1622,6 +1769,8 @@ export async function createAppServerCodexTurnController({
     }
 
     closed = true;
+    cleanupAbortWatcher();
+    cleanupExitWatcher();
     for (const pendingToolRequest of pendingToolRequests.splice(0)) {
       if (pendingToolRequest.settled) {
         continue;
@@ -1677,6 +1826,14 @@ export async function createAppServerCodexTurnController({
     request.timeoutHandle.unref?.();
   }
 
+  function failController(error) {
+    if (completed || closed) {
+      return;
+    }
+    rejectStop(error);
+    void closeController(error);
+  }
+
   function emitNextPendingToolRequest() {
     const request = currentPendingToolRequest();
     if (!request || request.emitted || completed || closed) {
@@ -1699,6 +1856,13 @@ export async function createAppServerCodexTurnController({
     const sandbox = config.codex.sandbox || "workspace-write";
     const resumeThreadId = threadContext?.threadId || threadContext?.resumeThreadId;
     const resumeThreadPath = threadContext?.threadPath || threadContext?.resumeThreadPath;
+
+    cleanupAbortWatcher = observeAbortSignal(abortSignal, () => {
+      failController(buildCodexClientAbortError(abortSignal));
+    });
+    cleanupExitWatcher = observeClientExit(client, () => {
+      failController(buildCodexAppServerClosedError(client));
+    });
 
     client.setServerRequestHandler(async message => {
       if (message.method !== "item/tool/call") {
@@ -1867,6 +2031,7 @@ export async function createAppServerCodexTurnController({
       }
 
       stopSignal = createDeferred();
+      stopSignal.promise.catch(() => {});
       settlePendingToolRequest(activeRequest, "resolve", toolResult);
       logNativeToolBridgeEvent(
         logger,
@@ -1925,6 +2090,7 @@ async function createCodexTurnController({
   onEvent,
   threadContext,
   dynamicTools,
+  abortSignal,
   createTurnController,
 }) {
   return createTurnController({
@@ -1940,6 +2106,7 @@ async function createCodexTurnController({
     onEvent,
     threadContext,
     dynamicTools,
+    abortSignal,
   });
 }
 
@@ -1955,6 +2122,7 @@ async function runCodexTurnDirect({
   summary,
   onEvent,
   threadContext,
+  abortSignal,
 }) {
   return runTurn({
     config,
@@ -1968,6 +2136,7 @@ async function runCodexTurnDirect({
     summary,
     onEvent,
     threadContext,
+    abortSignal,
   });
 }
 
@@ -2417,11 +2586,32 @@ export function createCodexBackend({
     await Promise.all(sessionsToClose.map(entry => entry.controller.close()));
   }
 
-  async function awaitControllerStop(stopPromise) {
-    return ensureCompletedCodexControllerOutcome(await stopPromise);
+  async function awaitControllerStop(stopPromise, { abortSignal = null, controller = null } = {}) {
+    if (!abortSignal) {
+      return ensureCompletedCodexControllerOutcome(await stopPromise);
+    }
+
+    const abortPromise = createDeferred();
+    abortPromise.promise.catch(() => {});
+    const cleanupAbortWatcher = observeAbortSignal(abortSignal, () => {
+      const error = buildCodexClientAbortError(abortSignal);
+      abortPromise.reject(error);
+      if (controller?.close) {
+        void controller.close();
+      }
+    });
+
+    try {
+      return ensureCompletedCodexControllerOutcome(await Promise.race([
+        stopPromise,
+        abortPromise.promise,
+      ]));
+    } finally {
+      cleanupAbortWatcher();
+    }
   }
 
-  async function continuePendingToolSession(body, onEvent) {
+  async function continuePendingToolSession(body, onEvent, options = {}) {
     const key = pendingToolSessionKey(body);
     const pendingSessions = getPendingToolSessions(key);
     if (pendingSessions.length === 0) {
@@ -2442,7 +2632,13 @@ export function createCodexBackend({
     pendingSession.controller.setOnEvent(onEvent);
     const toolResult = buildDynamicToolResponseFromAnthropic(body, pendingSession.toolCall.id);
     try {
-      const outcome = await awaitControllerStop(pendingSession.controller.resumeWithToolResult(toolResult));
+      const outcome = await awaitControllerStop(
+        pendingSession.controller.resumeWithToolResult(toolResult),
+        {
+          abortSignal: options.abortSignal,
+          controller: pendingSession.controller,
+        },
+      );
       if (outcome.type === "tool_request") {
         pendingSession.toolCall = outcome.toolCall;
       } else {
@@ -2470,6 +2666,7 @@ export function createCodexBackend({
     dynamicToolRegistry,
     thinkingEnabled,
     onEvent,
+    abortSignal,
   }) {
     const controller = await createCodexTurnController({
       config,
@@ -2487,13 +2684,17 @@ export function createCodexBackend({
       },
       dynamicTools: dynamicToolRegistry.specs,
       registeredToOriginalToolName: dynamicToolRegistry.registeredToOriginalName,
+      abortSignal,
       createTurnController,
     });
 
     try {
       return {
         controller,
-        outcome: await awaitControllerStop(controller.waitForStop()),
+        outcome: await awaitControllerStop(controller.waitForStop(), {
+          abortSignal,
+          controller,
+        }),
       };
     } catch (error) {
       await controller.close();
@@ -2518,8 +2719,10 @@ export function createCodexBackend({
         input_tokens: approximateTokensFromTurnInput(turnInput),
       };
     },
-    async createMessage(body) {
-      const pendingOutcome = await continuePendingToolSession(body, undefined);
+    async createMessage(body, context = {}) {
+      const pendingOutcome = await continuePendingToolSession(body, undefined, {
+        abortSignal: context.abortSignal,
+      });
       if (pendingOutcome) {
         const { controller, outcome } = pendingOutcome;
         if (outcome.type === "tool_request") {
@@ -2530,6 +2733,7 @@ export function createCodexBackend({
             outcome.usage,
             {
               toolUseId: outcome.toolCall.id,
+              inputSchema: findNativeAnthropicToolSchema(body?.tools, outcome.toolCall.name),
             },
           );
         }
@@ -2591,6 +2795,7 @@ export function createCodexBackend({
           resolvedModel,
           dynamicToolRegistry,
           thinkingEnabled: isThinkingEnabled(body),
+          abortSignal: context.abortSignal,
         });
 
         if (outcome.type === "tool_request") {
@@ -2605,6 +2810,7 @@ export function createCodexBackend({
             outcome.usage,
             {
               toolUseId: outcome.toolCall.id,
+              inputSchema: findNativeAnthropicToolSchema(body?.tools, outcome.toolCall.name),
             },
           );
         }
@@ -2648,6 +2854,7 @@ export function createCodexBackend({
           threadId: sessionContext.resumeThreadId,
           threadPath: sessionContext.resumeThreadPath,
         },
+        abortSignal: context.abortSignal,
       });
       const completion = buildCodexCompletionArtifacts({
         body,
@@ -2669,7 +2876,7 @@ export function createCodexBackend({
       });
       return completion.response;
     },
-    async streamMessage(body, res) {
+    async streamMessage(body, res, context = {}) {
       const thinkingEnabled = isThinkingEnabled(body);
       const toolBridgeEnabled = hasNativeAnthropicTools(body);
 
@@ -2682,11 +2889,20 @@ export function createCodexBackend({
           externalModel: body.model,
           includeThinking: thinkingEnabled,
         });
-        const pendingOutcome = await continuePendingToolSession(body, event => pendingStreamBridge.handle(event));
+        const pendingOutcome = await continuePendingToolSession(body, event => pendingStreamBridge.handle(event), {
+          abortSignal: context.abortSignal,
+        });
         if (pendingOutcome) {
           const { controller, outcome } = pendingOutcome;
           if (outcome.type === "tool_request") {
-            pendingStreamBridge.emitToolUse(outcome.toolCall);
+            pendingStreamBridge.emitToolUse({
+              ...outcome.toolCall,
+              input: sanitizeAnthropicToolUseInput(
+                outcome.toolCall.name,
+                outcome.toolCall.input,
+                findNativeAnthropicToolSchema(body?.tools, outcome.toolCall.name),
+              ),
+            });
             pendingStreamBridge.finish(outcome.usage, "tool_use");
             return;
           }
@@ -2756,6 +2972,7 @@ export function createCodexBackend({
             dynamicToolRegistry,
             thinkingEnabled,
             onEvent: event => streamBridge.handle(event),
+            abortSignal: context.abortSignal,
           });
 
           if (outcome.type === "tool_request") {
@@ -2764,7 +2981,14 @@ export function createCodexBackend({
               toolCall: outcome.toolCall,
             });
 
-            streamBridge.emitToolUse(outcome.toolCall);
+            streamBridge.emitToolUse({
+              ...outcome.toolCall,
+              input: sanitizeAnthropicToolUseInput(
+                outcome.toolCall.name,
+                outcome.toolCall.input,
+                findNativeAnthropicToolSchema(body?.tools, outcome.toolCall.name),
+              ),
+            });
             streamBridge.finish(outcome.usage, "tool_use");
             return;
           }
@@ -2816,6 +3040,7 @@ export function createCodexBackend({
             threadPath: sessionContext.resumeThreadPath,
           },
           onEvent: event => streamBridge.handle(event),
+          abortSignal: context.abortSignal,
         });
         const completion = buildCodexCompletionArtifacts({
           body,
@@ -2848,6 +3073,13 @@ export function createCodexBackend({
         clearInterval(ping);
         res.end();
       }
+    },
+    async close() {
+      const sessionsToClose = [...pendingToolSessions.values()].flat();
+      pendingToolSessions.clear();
+      await Promise.allSettled(
+        sessionsToClose.map(session => session?.controller?.close?.()),
+      );
     },
   };
 }

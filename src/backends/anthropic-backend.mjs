@@ -122,11 +122,12 @@ export function createAnthropicBackend({
 } = {}) {
   const upstreamBaseUrl = String(baseUrl || "https://api.anthropic.com").trim() || "https://api.anthropic.com";
 
-  async function postJson(pathname, body, requestHeaders, requestUrl) {
+  async function postJson(pathname, body, requestHeaders, requestUrl, abortSignal) {
     const response = await fetchImpl(buildUpstreamUrl(upstreamBaseUrl, pathname, requestUrl), {
       method: "POST",
       headers: buildForwardHeaders(requestHeaders),
       body: JSON.stringify(sanitizeAnthropicBody(body)),
+      signal: abortSignal,
     });
 
     return parseJsonResponse(response);
@@ -135,16 +136,17 @@ export function createAnthropicBackend({
   return {
     kind: "anthropic",
     async countTokens(body, context = {}) {
-      return postJson("/v1/messages/count_tokens", body, context.requestHeaders, context.requestUrl);
+      return postJson("/v1/messages/count_tokens", body, context.requestHeaders, context.requestUrl, context.abortSignal);
     },
     async createMessage(body, context = {}) {
-      return postJson("/v1/messages", body, context.requestHeaders, context.requestUrl);
+      return postJson("/v1/messages", body, context.requestHeaders, context.requestUrl, context.abortSignal);
     },
     async streamMessage(body, res, context = {}) {
       const response = await fetchImpl(buildUpstreamUrl(upstreamBaseUrl, "/v1/messages", context.requestUrl), {
         method: "POST",
         headers: buildForwardHeaders(context.requestHeaders),
         body: JSON.stringify(sanitizeAnthropicBody(body)),
+        signal: context.abortSignal,
       });
 
       if (!response.ok) {
