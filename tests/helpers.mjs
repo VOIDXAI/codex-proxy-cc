@@ -12,6 +12,17 @@ export function createCaptureResponse() {
   let headers = null;
   let body = "";
 
+  function appendChunk(chunk) {
+    if (chunk === undefined || chunk === null) {
+      return;
+    }
+    if (typeof chunk === "string") {
+      body += chunk;
+      return;
+    }
+    body += Buffer.from(chunk).toString("utf8");
+  }
+
   return {
     writeHead(statusCode, responseHeaders) {
       headers = {
@@ -20,10 +31,10 @@ export function createCaptureResponse() {
       };
     },
     write(chunk) {
-      body += chunk.toString();
+      appendChunk(chunk);
     },
     end(chunk = "") {
-      body += chunk.toString();
+      appendChunk(chunk);
     },
     get statusCode() {
       return headers?.statusCode ?? null;

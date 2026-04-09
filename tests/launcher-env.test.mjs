@@ -23,15 +23,17 @@ test("buildClaudeEnv injects gateway settings and privacy toggles", () => {
     gatewayUrl: "http://127.0.0.1:43123",
     localToken: "token-123",
     config: DEFAULT_CONFIG,
+    cliBinaryPath: "/tmp/codex-proxy-cc-bin",
   });
 
   assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:43123");
   assert.equal(env.ANTHROPIC_AUTH_TOKEN, undefined);
   assert.equal(env.ANTHROPIC_API_KEY, undefined);
-  assert.equal(env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "gpt-5.4-mini");
-  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, "gpt-5.4");
-  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, "gpt-5.4");
+  assert.equal(env.ANTHROPIC_DEFAULT_HAIKU_MODEL, undefined);
+  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, undefined);
+  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, undefined);
   assert.equal(env.CLAUDE_CODE_EFFORT_LEVEL, undefined);
+  assert.equal(env.CODEX_PROXY_CC_BIN, "/tmp/codex-proxy-cc-bin");
   assert.equal(env.ANTHROPIC_CUSTOM_HEADERS, "x-existing: keep-me");
   assert.equal(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined);
   assert.equal(env.DISABLE_TELEMETRY, undefined);
@@ -39,7 +41,7 @@ test("buildClaudeEnv injects gateway settings and privacy toggles", () => {
   assert.equal(env.DISABLE_FEEDBACK_COMMAND, undefined);
 });
 
-test("buildClaudeEnv derives Claude default model env vars from configured Codex targets", () => {
+test("buildClaudeEnv leaves Claude default model env vars untouched even when profiles are customized", () => {
   const env = buildClaudeEnv({
     parentEnv: {
       PATH: process.env.PATH || "",
@@ -66,9 +68,9 @@ test("buildClaudeEnv derives Claude default model env vars from configured Codex
     },
   });
 
-  assert.equal(env.ANTHROPIC_DEFAULT_HAIKU_MODEL, "gpt-5-mini-custom");
-  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, "gpt-5-main-custom");
-  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, "gpt-5-deep-custom");
+  assert.equal(env.ANTHROPIC_DEFAULT_HAIKU_MODEL, undefined);
+  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, undefined);
+  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, undefined);
 });
 
 test("buildClaudeEnv can pin Claude effort environment overrides", () => {

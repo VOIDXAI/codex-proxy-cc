@@ -21,8 +21,8 @@ export const DEFAULT_CONFIG = {
       effort: "low",
     },
     sonnet: {
-      model: "gpt-5.4",
-      codexModel: "gpt-5.4",
+      model: "gpt-5.2",
+      codexModel: "gpt-5.2",
       effort: "medium",
     },
     opus: {

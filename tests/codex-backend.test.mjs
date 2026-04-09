@@ -1169,7 +1169,7 @@ test("codex backend prefers opus routing for direct gpt-5.4 requests with high e
     anthropicEffort: "high",
     profile: "opus",
     targetModel: "gpt-5.4",
-    effort: "xhigh",
+    effort: "high",
     stream: false,
     nativeToolBridge: false,
   });

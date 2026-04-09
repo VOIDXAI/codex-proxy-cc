@@ -14,7 +14,7 @@ test("resolveModelConfig maps Claude model families onto Codex target models", (
 
   assert.deepEqual(resolveModelConfig(DEFAULT_CONFIG, "claude-sonnet-4-6"), {
     externalModel: "claude-sonnet-4-6",
-    targetModel: "gpt-5.4",
+    targetModel: "gpt-5.2",
     effort: "medium",
     profileName: "sonnet",
   });
@@ -29,7 +29,7 @@ test("resolveModelConfig maps Claude model families onto Codex target models", (
   assert.deepEqual(resolveModelConfig(DEFAULT_CONFIG, "claude-opus-4-6", "high"), {
     externalModel: "claude-opus-4-6",
     targetModel: "gpt-5.4",
-    effort: "xhigh",
+    effort: "high",
     profileName: "opus",
   });
 
@@ -42,7 +42,7 @@ test("resolveModelConfig maps Claude model families onto Codex target models", (
 
   assert.deepEqual(resolveModelConfig(DEFAULT_CONFIG, "sonnet[1m]"), {
     externalModel: "sonnet[1m]",
-    targetModel: "gpt-5.4",
+    targetModel: "gpt-5.2",
     effort: "medium",
     profileName: "sonnet",
   });
@@ -90,16 +90,23 @@ test("resolveModelConfig accepts direct Codex target model ids from Claude env o
     profileName: "opus",
   });
 
+  assert.deepEqual(resolveModelConfig(DEFAULT_CONFIG, "gpt-5.2"), {
+    externalModel: "gpt-5.2",
+    targetModel: "gpt-5.2",
+    effort: "medium",
+    profileName: "sonnet",
+  });
+
   assert.deepEqual(resolveModelConfig(DEFAULT_CONFIG, "gpt-5.4", "high"), {
     externalModel: "gpt-5.4",
     targetModel: "gpt-5.4",
-    effort: "xhigh",
+    effort: "high",
     profileName: "opus",
   });
 
   assert.deepEqual(resolveModelConfig(DEFAULT_CONFIG, "claude-sonnet-4-6", "high"), {
     externalModel: "claude-sonnet-4-6",
-    targetModel: "gpt-5.4",
+    targetModel: "gpt-5.2",
     effort: "high",
     profileName: "sonnet",
   });

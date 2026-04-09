@@ -1,3 +1,6 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { inspectEffectiveConfig } from "./config/inspection.mjs";
 import { loadConfig } from "./config/load-config.mjs";
 import { getCodexBackendStatus } from "./backends/codex-backend.mjs";
@@ -10,21 +13,29 @@ import {
   inspectLoopbackProxyBypass,
 } from "./launcher/env.mjs";
 import { launchClaude } from "./launcher/run.mjs";
+import { ensureSessionPlugin } from "./plugins/project-plugin.mjs";
+import { getRouteStatus, setRouteMode } from "./route/control-client.mjs";
 import { createLogger, defaultRuntimeLogFilePath } from "./shared/logging.mjs";
+import { AppError } from "./shared/errors.mjs";
 
 function parseOptions(argv) {
   const args = [...argv];
   let command = "run";
+  let routeSubcommand = null;
   const passthrough = [];
   let configPath;
   let verbose = false;
   const overrides = {};
   let json = false;
+  let sessionId;
 
-  if (args[0] && ["run", "gateway", "doctor", "config", "help"].includes(args[0])) {
+  if (args[0] && ["run", "gateway", "doctor", "config", "route", "help"].includes(args[0])) {
     command = args.shift();
     if (command === "config" && args[0] === "dump") {
       args.shift();
+    }
+    if (command === "route" && args[0] && !args[0].startsWith("-")) {
+      routeSubcommand = args.shift();
     }
   }
 
@@ -65,6 +76,9 @@ function parseOptions(argv) {
       case "--json":
         json = true;
         break;
+      case "--session-id":
+        sessionId = args.shift();
+        break;
       case "--codex-binary":
         overrides.codex ??= {};
         overrides.codex.binary = args.shift();
@@ -86,6 +100,8 @@ function parseOptions(argv) {
     passthrough,
     verbose,
     json,
+    routeSubcommand,
+    sessionId,
   };
 }
 
@@ -97,6 +113,7 @@ Usage:
   codex-proxy-cc gateway
   codex-proxy-cc doctor
   codex-proxy-cc config [dump]
+  codex-proxy-cc route [codex|claude|status] --session-id <id>
 
 Options:
   --config <path>          Path to JSON config file
@@ -105,6 +122,7 @@ Options:
   --claude-binary <path>   Claude Code binary or command name
   --claude-effort-level    inherit | unset | auto | low | medium | high | max
   --codex-binary <path>    Codex binary or command name
+  --session-id <id>        Claude session id for route control
   --log-level <level>      debug | info | warn | error
   --json                   Print machine-readable JSON for supported commands
   --verbose                Print extra config and routing details
@@ -246,6 +264,62 @@ function printDoctorSummary(payload) {
 
   // eslint-disable-next-line no-console
   console.log(lines.join("\n"));
+}
+
+function resolveCliBinaryPath() {
+  if (process.argv[1]) {
+    return path.resolve(process.argv[1]);
+  }
+
+  return fileURLToPath(new URL("../bin/codex-proxy-cc.mjs", import.meta.url));
+}
+
+async function ensureSessionPluginForCommand({
+  logger,
+  strict,
+  env = process.env,
+} = {}) {
+  try {
+    return await ensureSessionPlugin({
+      env,
+      logger,
+    });
+  } catch (error) {
+    if (strict) {
+      throw error;
+    }
+    logger?.warn?.("Failed to ensure Claude plugin", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+function printRouteSummary(payload) {
+  // eslint-disable-next-line no-console
+  console.log(`mode: ${payload.mode || "unknown"}`);
+}
+
+async function runRouteCommand({ routeSubcommand, sessionId, json }) {
+  const action = routeSubcommand || "status";
+
+  if (!["codex", "claude", "status"].includes(action)) {
+    throw new AppError(`Unsupported route subcommand '${action}'`, {
+      status: 400,
+      type: "invalid_request_error",
+    });
+  }
+
+  const payload = action === "status"
+    ? await getRouteStatus({ sessionId })
+    : await setRouteMode({ sessionId, mode: action });
+
+  if (json) {
+    printJsonPayload(payload);
+    return;
+  }
+
+  printRouteSummary(payload);
 }
 
 async function runConfigCommand({ config, configPath, layers, verbose, json }) {
@@ -405,6 +479,10 @@ function createRuntimeLogger(config, claudeArgs, logger) {
 
 async function runDefaultCommand(config, logger, claudeArgs) {
   const runtimeLogger = createRuntimeLogger(config, claudeArgs, logger);
+  const sessionPlugin = await ensureSessionPluginForCommand({
+    logger: runtimeLogger,
+    strict: false,
+  });
   const localToken = generateLocalGatewayToken();
   const gateway = await startGatewayServer({
     config,
@@ -413,14 +491,17 @@ async function runDefaultCommand(config, logger, claudeArgs) {
   });
 
   const env = buildClaudeEnv({
+    parentEnv: process.env,
     gatewayUrl: gateway.url,
     localToken,
     config,
+    cliBinaryPath: resolveCliBinaryPath(),
   });
 
   const code = await launchClaude({
     binary: config.claude.binary,
     args: claudeArgs,
+    pluginDirs: sessionPlugin?.pluginPath ? [sessionPlugin.pluginPath] : [],
     env,
     gateway,
     logger: runtimeLogger,
@@ -433,6 +514,16 @@ export async function main(argv = process.argv.slice(2)) {
   const parsed = parseOptions(argv);
   if (parsed.command === "help") {
     printHelp();
+    return;
+  }
+
+  if (parsed.command === "route") {
+    await runRouteCommand({
+      routeSubcommand: parsed.routeSubcommand,
+      sessionId: parsed.sessionId,
+      json: parsed.json,
+    });
+    process.exit(0);
     return;
   }
 

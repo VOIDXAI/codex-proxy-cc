@@ -1,6 +1,8 @@
 import http from "node:http";
 
+import { createAnthropicBackend } from "../backends/anthropic-backend.mjs";
 import { createGatewayBackend } from "../backends/create-backend.mjs";
+import { resolveRouteStatus } from "../route/status.mjs";
 import { AppError } from "../shared/errors.mjs";
 import { readJsonBody, writeAnthropicError, writeJson } from "../shared/http.mjs";
 
@@ -72,13 +74,57 @@ function attachProxyContext(body, headers) {
   return body;
 }
 
-export function createGatewayHandler({ config, logger, localToken, backend, sessionStore }) {
-  const selectedBackend = createGatewayBackend({
+function normalizeRouteMode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "codex" || normalized === "claude") {
+    return normalized;
+  }
+
+  throw new AppError("Route mode must be 'codex' or 'claude'", {
+    status: 400,
+    type: "invalid_request_error",
+  });
+}
+
+function getSessionMode(sessionModes, sessionId) {
+  if (!sessionId) {
+    return "codex";
+  }
+  return sessionModes.get(sessionId) || "codex";
+}
+
+function logClaudePassthroughRouting(logger, body, options = {}) {
+  const logLevel = logger?.console === false ? "info" : "debug";
+  logger?.[logLevel]?.("Claude passthrough routing", {
+    externalModel: body?.model ?? null,
+    anthropicEffort: body?.output_config?.effort ?? null,
+    targetModel: body?.model ?? null,
+    targetEffort: body?.output_config?.effort ?? null,
+    stream: Boolean(options.stream),
+  });
+}
+
+export function createGatewayHandler({
+  config,
+  logger,
+  localToken,
+  backend,
+  claudeBackend,
+  sessionStore,
+  projectRoot = process.cwd(),
+  env = process.env,
+  nativeAnthropicBaseUrl = process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com",
+}) {
+  const codexBackend = createGatewayBackend({
     config,
     logger,
     backend,
     sessionStore,
   });
+  const nativeBackend = claudeBackend || createAnthropicBackend({
+    baseUrl: nativeAnthropicBaseUrl,
+  });
+  const sessionModes = new Map();
 
   const allowLoopbackWithoutToken = shouldAllowLoopbackWithoutToken(config.server.bind);
 
@@ -95,7 +141,7 @@ export function createGatewayHandler({ config, logger, localToken, backend, sess
       if (url.pathname === "/" && req.method === "GET") {
         writeJson(res, 200, {
           ok: true,
-          provider: selectedBackend.kind,
+          provider: codexBackend.kind,
         });
         return;
       }
@@ -103,12 +149,66 @@ export function createGatewayHandler({ config, logger, localToken, backend, sess
       if (url.pathname === "/healthz" && req.method === "GET") {
         writeJson(res, 200, {
           ok: true,
-          provider: selectedBackend.kind,
+          provider: codexBackend.kind,
         });
         return;
       }
 
       ensureAuthorized(req, localToken, allowLoopbackWithoutToken);
+
+      if (url.pathname === "/codex-proxy-cc/control/route" && req.method === "GET") {
+        const sessionId = url.searchParams.get("session_id")?.trim();
+        if (!sessionId) {
+          throw new AppError("Missing session_id", {
+            status: 400,
+            type: "invalid_request_error",
+          });
+        }
+
+        const mode = getSessionMode(sessionModes, sessionId);
+        const status = await resolveRouteStatus({
+          config,
+          mode,
+          cwd: projectRoot,
+          env,
+        });
+
+        writeJson(res, 200, {
+          sessionId,
+          changed: false,
+          ...status,
+        });
+        return;
+      }
+
+      if (url.pathname === "/codex-proxy-cc/control/route" && req.method === "POST") {
+        const body = await readJsonBody(req);
+        const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
+        if (!sessionId) {
+          throw new AppError("Missing sessionId", {
+            status: 400,
+            type: "invalid_request_error",
+          });
+        }
+
+        const nextMode = normalizeRouteMode(body.mode);
+        const previousMode = getSessionMode(sessionModes, sessionId);
+        sessionModes.set(sessionId, nextMode);
+
+        const status = await resolveRouteStatus({
+          config,
+          mode: nextMode,
+          cwd: projectRoot,
+          env,
+        });
+
+        writeJson(res, 200, {
+          sessionId,
+          changed: previousMode !== nextMode,
+          ...status,
+        });
+        return;
+      }
 
       if (url.pathname === "/v1/models" && req.method === "GET") {
         writeJson(res, 200, {
@@ -122,7 +222,13 @@ export function createGatewayHandler({ config, logger, localToken, backend, sess
 
       if (url.pathname === "/v1/messages/count_tokens" && req.method === "POST") {
         const body = attachProxyContext(await readJsonBody(req), req.headers);
-        const tokenCounts = await selectedBackend.countTokens(body);
+        const backendForRequest =
+          getSessionMode(sessionModes, body?._codexProxyCc?.sessionId) === "claude"
+            ? nativeBackend
+            : codexBackend;
+        const tokenCounts = await backendForRequest.countTokens(body, {
+          requestHeaders: req.headers,
+        });
         writeJson(res, 200, {
           input_tokens: tokenCounts.input_tokens,
         });
@@ -131,13 +237,25 @@ export function createGatewayHandler({ config, logger, localToken, backend, sess
 
       if (url.pathname === "/v1/messages" && req.method === "POST") {
         const body = attachProxyContext(await readJsonBody(req), req.headers);
+        const routeMode = getSessionMode(sessionModes, body?._codexProxyCc?.sessionId);
+        const backendForRequest = routeMode === "claude" ? nativeBackend : codexBackend;
+
+        if (routeMode === "claude") {
+          logClaudePassthroughRouting(logger, body, {
+            stream: Boolean(body.stream),
+          });
+        }
 
         if (body.stream) {
-          await selectedBackend.streamMessage(body, res);
+          await backendForRequest.streamMessage(body, res, {
+            requestHeaders: req.headers,
+          });
           return;
         }
 
-        const anthropicResponse = await selectedBackend.createMessage(body);
+        const anthropicResponse = await backendForRequest.createMessage(body, {
+          requestHeaders: req.headers,
+        });
         writeJson(res, 200, anthropicResponse);
         return;
       }
@@ -162,16 +280,32 @@ export async function startGatewayServer({
   logger,
   localToken,
   backend,
+  claudeBackend = null,
   sessionStore = null,
+  projectRoot = process.cwd(),
+  env = process.env,
+  nativeAnthropicBaseUrl = process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com",
 }) {
   const handler = createGatewayHandler({
     config,
     logger,
     localToken,
     backend,
+    claudeBackend,
     sessionStore,
+    projectRoot,
+    env,
+    nativeAnthropicBaseUrl,
   });
   const server = http.createServer(handler);
+  const sockets = new Set();
+
+  server.on("connection", socket => {
+    sockets.add(socket);
+    socket.on("close", () => {
+      sockets.delete(socket);
+    });
+  });
 
   await new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -189,6 +323,9 @@ export async function startGatewayServer({
     port: address.port,
     url: `http://${address.address}:${address.port}`,
     async close() {
+      for (const socket of sockets) {
+        socket.destroy();
+      }
       await new Promise(resolve => server.close(resolve));
     },
   };

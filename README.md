@@ -6,7 +6,7 @@ Run Claude Code through a local Anthropic-compatible gateway that keeps Claude C
 
 - Claude Code stays in charge of tools, permissions, remote control, plan mode, MCP, resume, and UI behavior
 - the proxy only injects a local Anthropic base URL and forwards Claude-shaped requests to a Codex-backed runtime
-- runtime support is Codex-only
+- each Claude session can switch between Codex routing and native Claude passthrough without restarting
 
 ## TL;DR
 
@@ -25,6 +25,7 @@ Working today:
 
 - interactive TUI sessions
 - print mode
+- generated session-only `/codex-proxy-cc:route` command for route switching
 - native `tool_use` / `tool_result` bridging
 - streaming text responses
 - `/plan` text streaming plus raw reasoning/thinking streaming when Codex exposes it
@@ -42,15 +43,18 @@ Not a goal:
 
 - starts a local gateway on `127.0.0.1`
 - points Claude Code at that gateway with `ANTHROPIC_BASE_URL`
+- leaves `ANTHROPIC_DEFAULT_*` untouched so Claude keeps its own default model names
 - allows loopback Claude Code traffic by default and still supports a generated local token for non-loopback gateway binds
 - forwards Claude Code requests with minimal mutation
 - bridges Codex dynamic tool calls back into Claude Code native tool loops
+- auto-generates a managed session-only Claude plugin and loads it with `claude --plugin-dir`
 
 ## Why Use It
 
 - keep Claude Code’s native UX instead of replacing it with a different agent shell
 - keep Claude Code tool permissions, remote features, and local workflows
 - route the actual model sampling through Codex
+- flip a live session back to Claude passthrough when you want, without restarting or losing the Claude-side conversation context
 - keep Claude-shaped model aliases like `haiku`, `sonnet`, and `opus`
 
 ## Install
@@ -104,6 +108,14 @@ Run only the gateway:
 codex-proxy-cc gateway
 ```
 
+Show or switch the current session route from inside Claude Code:
+
+```text
+/codex-proxy-cc:route status
+/codex-proxy-cc:route codex
+/codex-proxy-cc:route claude
+```
+
 Proxy flags go before `--`. Raw Claude Code flags go after `--`.
 
 ## Commands
@@ -113,11 +125,13 @@ Proxy flags go before `--`. Raw Claude Code flags go after `--`.
 - `codex-proxy-cc gateway`
 - `codex-proxy-cc doctor`
 - `codex-proxy-cc config`
+- `codex-proxy-cc route [codex|claude|status] --session-id <id>`
 
 ## Options
 
 - `--config <path>`
 - `--bind <host>`
+- `--session-id <id>`
 - `--port <port>`
 - `--claude-binary <path>`
 - `--claude-effort-level inherit|unset|auto|low|medium|high|max`
@@ -137,21 +151,21 @@ Claude-facing names stay Claude-shaped. Profiles map them onto Codex models and 
 Default profiles:
 
 - `haiku` -> `gpt-5.4-mini` + `low`
-- `sonnet` -> `gpt-5.4` + `medium`
+- `sonnet` -> `gpt-5.2` + `medium`
 - `opus` -> `gpt-5.4` + `xhigh`
 
 Anthropic effort overrides are mapped like this:
 
 - `low -> low`
 - `medium -> medium`
-- `high -> high` for non-Opus profiles
-- `high -> xhigh` for profile `opus`
+- `high -> high`
 - `max -> xhigh`
 
 Direct model ids are also accepted:
 
 - `gpt-5.4-mini` -> profile `haiku`
-- `gpt-5.4` -> profile `opus` when the target is ambiguous between `sonnet` and `opus`
+- `gpt-5.2` -> profile `sonnet`
+- `gpt-5.4` -> profile `opus`
 
 ## Configuration
 
@@ -182,7 +196,7 @@ Example:
   },
   "profiles": {
     "haiku": { "model": "gpt-5-mini", "codexModel": "gpt-5.4-mini", "effort": "low" },
-    "sonnet": { "model": "gpt-5.4", "codexModel": "gpt-5.4", "effort": "medium" },
+    "sonnet": { "model": "gpt-5.2", "codexModel": "gpt-5.2", "effort": "medium" },
     "opus": { "model": "gpt-5.4-pro", "codexModel": "gpt-5.4", "effort": "xhigh" }
   },
   "anthropic": {
@@ -219,6 +233,11 @@ default state path `~/.local/state/codex-proxy-cc/runtime.log`:
 Privacy toggles are opt-in. By default the launcher leaves Claude Code's native
 feature and auth surface intact so built-in commands like `/usage`,
 `/remote-control`, and plan mode keep working.
+
+The generated `/codex-proxy-cc:route` command is session-only. `codex-proxy-cc`
+injects Claude's `--plugin-dir <path>` flag at launch time, so plain `claude`
+invocations are not polluted by this plugin unless you explicitly pass the same
+plugin directory yourself.
 
 Environment overrides:
 

@@ -1,6 +1,5 @@
 import crypto from "node:crypto";
 
-import { resolveModelConfig } from "../adapters/model-mapping.mjs";
 import { AppError } from "../shared/errors.mjs";
 import { resolveBinaryOnPath } from "../shared/resolve-binary.mjs";
 
@@ -52,10 +51,8 @@ export function buildClaudeEnv({
   gatewayUrl,
   localToken,
   config,
+  cliBinaryPath,
 }) {
-  const defaultHaikuModel = resolveModelConfig(config, "haiku").targetModel;
-  const defaultSonnetModel = resolveModelConfig(config, "sonnet").targetModel;
-  const defaultOpusModel = resolveModelConfig(config, "opus").targetModel;
   const loopbackGateway = isLoopbackGatewayUrl(gatewayUrl);
   const shouldInjectGatewayToken = !loopbackGateway;
   const proxyBypassEnv = loopbackGateway
@@ -67,9 +64,7 @@ export function buildClaudeEnv({
     ANTHROPIC_BASE_URL: gatewayUrl,
     ...proxyBypassEnv,
     ...(shouldInjectGatewayToken ? { ANTHROPIC_AUTH_TOKEN: localToken } : {}),
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: defaultHaikuModel,
-    ANTHROPIC_DEFAULT_SONNET_MODEL: defaultSonnetModel,
-    ANTHROPIC_DEFAULT_OPUS_MODEL: defaultOpusModel,
+    ...(cliBinaryPath ? { CODEX_PROXY_CC_BIN: cliBinaryPath } : {}),
     ...(config.claude?.effortLevel && config.claude.effortLevel !== "inherit"
       ? { CLAUDE_CODE_EFFORT_LEVEL: config.claude.effortLevel }
       : {}),

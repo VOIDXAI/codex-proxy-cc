@@ -125,10 +125,6 @@ export function resolveModelConfig(config, externalModel, anthropicEffort) {
     }
   }
 
-  if (profileName === "opus" && effort === "high") {
-    effort = "xhigh";
-  }
-
   if (!KNOWN_REASONING_EFFORTS.has(effort)) {
     throw new AppError(`Unsupported reasoning effort '${effort}'`, {
       status: 500,
