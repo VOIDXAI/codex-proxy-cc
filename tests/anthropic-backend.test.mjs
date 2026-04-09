@@ -60,12 +60,13 @@ test("anthropic backend forwards JSON requests and preserves Claude request head
           [LOCAL_GATEWAY_TOKEN_HEADER]: "local-token",
           connection: "keep-alive",
         },
+        requestUrl: "/v1/messages/count_tokens?beta=true",
       },
     );
 
     assert.deepEqual(response, { input_tokens: 7 });
     assert.equal(requests.length, 1);
-    assert.equal(requests[0].url, "/v1/messages/count_tokens");
+    assert.equal(requests[0].url, "/v1/messages/count_tokens?beta=true");
     assert.equal(requests[0].headers.authorization, "Bearer upstream-token");
     assert.equal(requests[0].headers["anthropic-version"], "2023-06-01");
     assert.equal(requests[0].headers["anthropic-beta"], "oauth-2025-04-20");
@@ -86,7 +87,10 @@ test("anthropic backend strips proxy-private fields before forwarding upstream",
     for await (const chunk of req) {
       bodyChunks.push(chunk);
     }
-    requests.push(JSON.parse(Buffer.concat(bodyChunks).toString("utf8")));
+    requests.push({
+      url: req.url,
+      body: JSON.parse(Buffer.concat(bodyChunks).toString("utf8")),
+    });
     res.writeHead(200, {
       "content-type": "application/json",
     });
@@ -111,12 +115,14 @@ test("anthropic backend strips proxy-private fields before forwarding upstream",
         requestHeaders: {
           authorization: "Bearer upstream-token",
         },
+        requestUrl: "/v1/messages?beta=true",
       },
     );
 
     assert.equal(requests.length, 1);
-    assert.equal("_codexProxyCc" in requests[0], false);
-    assert.equal(requests[0].model, "claude-sonnet-4-6");
+    assert.equal(requests[0].url, "/v1/messages?beta=true");
+    assert.equal("_codexProxyCc" in requests[0].body, false);
+    assert.equal(requests[0].body.model, "claude-sonnet-4-6");
   });
 });
 
@@ -146,6 +152,7 @@ test("anthropic backend streams SSE responses through", async () => {
           "x-api-key": "upstream-key",
           "anthropic-version": "2023-06-01",
         },
+        requestUrl: "/v1/messages?beta=true",
       },
     );
 

@@ -58,6 +58,23 @@ function sanitizeAnthropicBody(body) {
   return sanitized;
 }
 
+function buildUpstreamUrl(upstreamBaseUrl, expectedPathname, requestUrl) {
+  let search = "";
+
+  if (typeof requestUrl === "string" && requestUrl.trim()) {
+    try {
+      const parsed = new URL(requestUrl, "http://127.0.0.1");
+      if (parsed.pathname === expectedPathname) {
+        search = parsed.search;
+      }
+    } catch {
+      search = "";
+    }
+  }
+
+  return new URL(`${expectedPathname}${search}`, upstreamBaseUrl);
+}
+
 async function throwUpstreamError(response) {
   let payload = null;
   let text = "";
@@ -105,8 +122,8 @@ export function createAnthropicBackend({
 } = {}) {
   const upstreamBaseUrl = String(baseUrl || "https://api.anthropic.com").trim() || "https://api.anthropic.com";
 
-  async function postJson(pathname, body, requestHeaders) {
-    const response = await fetchImpl(new URL(pathname, upstreamBaseUrl), {
+  async function postJson(pathname, body, requestHeaders, requestUrl) {
+    const response = await fetchImpl(buildUpstreamUrl(upstreamBaseUrl, pathname, requestUrl), {
       method: "POST",
       headers: buildForwardHeaders(requestHeaders),
       body: JSON.stringify(sanitizeAnthropicBody(body)),
@@ -118,13 +135,13 @@ export function createAnthropicBackend({
   return {
     kind: "anthropic",
     async countTokens(body, context = {}) {
-      return postJson("/v1/messages/count_tokens", body, context.requestHeaders);
+      return postJson("/v1/messages/count_tokens", body, context.requestHeaders, context.requestUrl);
     },
     async createMessage(body, context = {}) {
-      return postJson("/v1/messages", body, context.requestHeaders);
+      return postJson("/v1/messages", body, context.requestHeaders, context.requestUrl);
     },
     async streamMessage(body, res, context = {}) {
-      const response = await fetchImpl(new URL("/v1/messages", upstreamBaseUrl), {
+      const response = await fetchImpl(buildUpstreamUrl(upstreamBaseUrl, "/v1/messages", context.requestUrl), {
         method: "POST",
         headers: buildForwardHeaders(context.requestHeaders),
         body: JSON.stringify(sanitizeAnthropicBody(body)),

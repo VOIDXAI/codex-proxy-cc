@@ -233,6 +233,7 @@ export function createGatewayHandler({
             : codexBackend;
         const tokenCounts = await backendForRequest.countTokens(body, {
           requestHeaders: req.headers,
+          requestUrl: req.url,
         });
         writeJson(res, 200, {
           input_tokens: tokenCounts.input_tokens,
@@ -254,12 +255,14 @@ export function createGatewayHandler({
         if (body.stream) {
           await backendForRequest.streamMessage(body, res, {
             requestHeaders: req.headers,
+            requestUrl: req.url,
           });
           return;
         }
 
         const anthropicResponse = await backendForRequest.createMessage(body, {
           requestHeaders: req.headers,
+          requestUrl: req.url,
         });
         writeJson(res, 200, anthropicResponse);
         return;

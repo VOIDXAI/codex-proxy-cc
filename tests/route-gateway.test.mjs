@@ -479,6 +479,7 @@ test("gateway claude mode forwards Anthropic bodies unchanged except proxy-priva
     for await (const chunk of req) {
       bodyChunks.push(chunk);
     }
+    const url = new URL(req.url, "http://127.0.0.1");
 
     upstreamRequests.push({
       method: req.method,
@@ -491,7 +492,7 @@ test("gateway claude mode forwards Anthropic bodies unchanged except proxy-priva
       "content-type": "application/json",
     });
 
-    if (req.url === "/v1/messages/count_tokens") {
+    if (url.pathname === "/v1/messages/count_tokens") {
       res.end(JSON.stringify({ input_tokens: 42 }));
       return;
     }
@@ -543,7 +544,7 @@ test("gateway claude mode forwards Anthropic bodies unchanged except proxy-priva
           "x-claude-code-session-id": sessionId,
         };
 
-        const countResponse = await fetch(`${gateway.url}/v1/messages/count_tokens`, {
+        const countResponse = await fetch(`${gateway.url}/v1/messages/count_tokens?beta=true`, {
           method: "POST",
           headers,
           body: JSON.stringify(requestBody),
@@ -551,7 +552,7 @@ test("gateway claude mode forwards Anthropic bodies unchanged except proxy-priva
         assert.equal(countResponse.status, 200);
         assert.deepEqual(await countResponse.json(), { input_tokens: 42 });
 
-        const messageResponse = await fetch(`${gateway.url}/v1/messages`, {
+        const messageResponse = await fetch(`${gateway.url}/v1/messages?beta=true`, {
           method: "POST",
           headers,
           body: JSON.stringify(requestBody),
@@ -560,8 +561,8 @@ test("gateway claude mode forwards Anthropic bodies unchanged except proxy-priva
         assert.equal((await messageResponse.json()).content[0].text, "claude-upstream");
 
         assert.equal(upstreamRequests.length, 2);
-        assert.equal(upstreamRequests[0].url, "/v1/messages/count_tokens");
-        assert.equal(upstreamRequests[1].url, "/v1/messages");
+        assert.equal(upstreamRequests[0].url, "/v1/messages/count_tokens?beta=true");
+        assert.equal(upstreamRequests[1].url, "/v1/messages?beta=true");
         assert.deepEqual(upstreamRequests[0].body, requestBody);
         assert.deepEqual(upstreamRequests[1].body, requestBody);
         assert.equal(upstreamRequests[0].headers.authorization, "Bearer upstream-token");
