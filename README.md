@@ -64,6 +64,7 @@ Local repo install:
 ```bash
 git clone https://github.com/VOIDXAI/codex-proxy-cc.git
 cd codex-proxy-cc
+npm install
 npm link
 rehash
 ```
