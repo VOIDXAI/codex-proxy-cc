@@ -413,6 +413,105 @@ test("gateway preserves Claude conversation history when switching a session bet
   );
 });
 
+test("gateway claude mode reuses stored Claude OAuth when request auth is absent", async () => {
+  const upstreamRequests = [];
+  const sessionId = "session-route-stored-oauth";
+  const homeRoot = await mkdtemp(path.join(os.tmpdir(), "codex-proxy-cc-route-home-oauth-"));
+
+  await writeJson(path.join(homeRoot, ".claude", ".credentials.json"), {
+    claudeAiOauth: {
+      accessToken: "stored-access-token",
+      refreshToken: "stored-refresh-token",
+      expiresAt: Date.now() + 60 * 60 * 1000,
+      scopes: [
+        "user:profile",
+        "user:inference",
+        "user:sessions:claude_code",
+        "user:mcp_servers",
+        "user:file_upload",
+      ],
+      subscriptionType: "max",
+      rateLimitTier: "default_claude_max_5x",
+    },
+  });
+
+  await withHttpServer(async (req, res) => {
+    const bodyChunks = [];
+    for await (const chunk of req) {
+      bodyChunks.push(chunk);
+    }
+
+    upstreamRequests.push({
+      method: req.method,
+      url: req.url,
+      headers: req.headers,
+      body: JSON.parse(Buffer.concat(bodyChunks).toString("utf8")),
+    });
+
+    res.writeHead(200, {
+      "content-type": "application/json",
+    });
+    res.end(JSON.stringify({
+      type: "message",
+      role: "assistant",
+      model: "claude-sonnet-4-6",
+      content: [{ type: "text", text: "claude-oauth" }],
+    }));
+  }, async nativeAnthropicBaseUrl => {
+    await withGateway(
+      {
+        backend: {
+          kind: "codex-app-server",
+          async countTokens() {
+            return { input_tokens: 0 };
+          },
+          async createMessage() {
+            return {};
+          },
+          async streamMessage() {},
+        },
+        projectRoot: process.cwd(),
+        env: {
+          HOME: homeRoot,
+        },
+        nativeAnthropicBaseUrl,
+      },
+      async gateway => {
+        const switchResponse = await fetch(`${gateway.url}/codex-proxy-cc/control/route`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            sessionId,
+            mode: "claude",
+          }),
+        });
+        assert.equal(switchResponse.status, 200);
+
+        const response = await fetch(`${gateway.url}/v1/messages`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "anthropic-version": "2023-06-01",
+            "x-claude-code-session-id": sessionId,
+          },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-6",
+            messages: [{ role: "user", content: "hello" }],
+          }),
+        });
+
+        assert.equal(response.status, 200);
+        assert.equal((await response.json()).content[0].text, "claude-oauth");
+        assert.equal(upstreamRequests.length, 1);
+        assert.equal(upstreamRequests[0].headers.authorization, "Bearer stored-access-token");
+        assert.equal(upstreamRequests[0].headers["anthropic-beta"], "oauth-2025-04-20");
+      },
+    );
+  });
+});
+
 test("gateway claude mode forwards Anthropic bodies unchanged except proxy-private fields", async () => {
   const upstreamRequests = [];
   const sessionId = "session-route-passthrough";
@@ -479,7 +578,6 @@ test("gateway claude mode forwards Anthropic bodies unchanged except proxy-priva
     for await (const chunk of req) {
       bodyChunks.push(chunk);
     }
-    const url = new URL(req.url, "http://127.0.0.1");
 
     upstreamRequests.push({
       method: req.method,
@@ -492,7 +590,7 @@ test("gateway claude mode forwards Anthropic bodies unchanged except proxy-priva
       "content-type": "application/json",
     });
 
-    if (url.pathname === "/v1/messages/count_tokens") {
+    if (req.url === "/v1/messages/count_tokens?beta=true") {
       res.end(JSON.stringify({ input_tokens: 42 }));
       return;
     }

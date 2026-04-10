@@ -16,12 +16,15 @@
     "proxy"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
   },
   "bin": {
     "codex-proxy-cc": "./bin/codex-proxy-cc.mjs"
   },
   "scripts": {
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs"
+  },
+  "dependencies": {
+    "undici": "^8.0.2"
   }
 }

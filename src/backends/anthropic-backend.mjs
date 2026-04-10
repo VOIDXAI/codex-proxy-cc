@@ -1,5 +1,11 @@
 import { AppError, mapHttpStatusToAnthropicType } from "../shared/errors.mjs";
+import {
+  CLAUDE_AI_OAUTH_BETA_HEADER,
+  getClaudeAiOauthTokens,
+  mergeAnthropicBetaHeader,
+} from "../shared/claude-oauth.mjs";
 import { LOCAL_GATEWAY_TOKEN_HEADER } from "../shared/local-auth.mjs";
+import { createProxyAwareFetch } from "../shared/proxy-fetch.mjs";
 
 const BLOCKED_HEADERS = new Set([
   "host",
@@ -14,7 +20,7 @@ const BLOCKED_HEADERS = new Set([
   LOCAL_GATEWAY_TOKEN_HEADER,
 ]);
 
-function buildForwardHeaders(requestHeaders = {}) {
+async function buildForwardHeaders(requestHeaders = {}, options = {}) {
   const headers = {};
 
   for (const [rawName, rawValue] of Object.entries(requestHeaders || {})) {
@@ -41,6 +47,20 @@ function buildForwardHeaders(requestHeaders = {}) {
 
   if (!headers["content-type"]) {
     headers["content-type"] = "application/json";
+  }
+
+  if (!headers.authorization && !headers["x-api-key"]) {
+    const oauthTokens = await getClaudeAiOauthTokens({
+      env: options.env,
+      fetchImpl: options.fetchImpl,
+    });
+    if (oauthTokens?.accessToken) {
+      headers.authorization = `Bearer ${oauthTokens.accessToken}`;
+      headers["anthropic-beta"] = mergeAnthropicBetaHeader(
+        headers["anthropic-beta"],
+        CLAUDE_AI_OAUTH_BETA_HEADER,
+      );
+    }
   }
 
   return headers;
@@ -73,6 +93,21 @@ function buildUpstreamUrl(upstreamBaseUrl, expectedPathname, requestUrl) {
   }
 
   return new URL(`${expectedPathname}${search}`, upstreamBaseUrl);
+}
+
+function resolveUpstreamUrl(upstreamBaseUrl, expectedPathname, context = {}) {
+  if (typeof context.requestPath === "string" && context.requestPath.trim()) {
+    try {
+      const parsed = new URL(context.requestPath, "http://127.0.0.1");
+      if (parsed.pathname === expectedPathname) {
+        return new URL(`${parsed.pathname}${parsed.search}`, upstreamBaseUrl);
+      }
+    } catch {
+      // Fall back to the legacy requestUrl path handling below.
+    }
+  }
+
+  return buildUpstreamUrl(upstreamBaseUrl, expectedPathname, context.requestUrl);
 }
 
 async function throwUpstreamError(response) {
@@ -119,15 +154,20 @@ async function parseJsonResponse(response) {
 export function createAnthropicBackend({
   baseUrl = "https://api.anthropic.com",
   fetchImpl = fetch,
+  env = process.env,
 } = {}) {
   const upstreamBaseUrl = String(baseUrl || "https://api.anthropic.com").trim() || "https://api.anthropic.com";
+  const upstreamFetch = createProxyAwareFetch(fetchImpl, env);
 
-  async function postJson(pathname, body, requestHeaders, requestUrl, abortSignal) {
-    const response = await fetchImpl(buildUpstreamUrl(upstreamBaseUrl, pathname, requestUrl), {
+  async function postJson(pathname, body, context = {}) {
+    const response = await upstreamFetch(resolveUpstreamUrl(upstreamBaseUrl, pathname, context), {
       method: "POST",
-      headers: buildForwardHeaders(requestHeaders),
+      headers: await buildForwardHeaders(context.requestHeaders, {
+        env,
+        fetchImpl,
+      }),
       body: JSON.stringify(sanitizeAnthropicBody(body)),
-      signal: abortSignal,
+      signal: context.abortSignal,
     });
 
     return parseJsonResponse(response);
@@ -136,15 +176,18 @@ export function createAnthropicBackend({
   return {
     kind: "anthropic",
     async countTokens(body, context = {}) {
-      return postJson("/v1/messages/count_tokens", body, context.requestHeaders, context.requestUrl, context.abortSignal);
+      return postJson("/v1/messages/count_tokens", body, context);
     },
     async createMessage(body, context = {}) {
-      return postJson("/v1/messages", body, context.requestHeaders, context.requestUrl, context.abortSignal);
+      return postJson("/v1/messages", body, context);
     },
     async streamMessage(body, res, context = {}) {
-      const response = await fetchImpl(buildUpstreamUrl(upstreamBaseUrl, "/v1/messages", context.requestUrl), {
+      const response = await upstreamFetch(resolveUpstreamUrl(upstreamBaseUrl, "/v1/messages", context), {
         method: "POST",
-        headers: buildForwardHeaders(context.requestHeaders),
+        headers: await buildForwardHeaders(context.requestHeaders, {
+          env,
+          fetchImpl,
+        }),
         body: JSON.stringify(sanitizeAnthropicBody(body)),
         signal: context.abortSignal,
       });

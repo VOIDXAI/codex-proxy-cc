@@ -166,6 +166,7 @@ export function createGatewayHandler({
   });
   const resolvedNativeBackend = nativeBackend || claudeBackend || createAnthropicBackend({
     baseUrl: nativeAnthropicBaseUrl,
+    env,
   });
   const sessionModes = new Map();
 
@@ -174,6 +175,7 @@ export function createGatewayHandler({
   return async function gatewayHandler(req, res) {
     const url = parseRequestedUrl(req);
     const requestAbort = createRequestAbortController(req, res);
+    const requestPath = `${url.pathname}${url.search}`;
 
     try {
       if (url.pathname === "/" && req.method === "HEAD") {
@@ -272,6 +274,7 @@ export function createGatewayHandler({
             : resolvedCodexBackend;
         const tokenCounts = await backendForRequest.countTokens(body, {
           requestHeaders: req.headers,
+          requestPath,
           requestUrl: req.url,
           abortSignal: requestAbort.signal,
         });
@@ -295,6 +298,7 @@ export function createGatewayHandler({
         if (body.stream) {
           await backendForRequest.streamMessage(body, res, {
             requestHeaders: req.headers,
+            requestPath,
             requestUrl: req.url,
             abortSignal: requestAbort.signal,
           });
@@ -303,6 +307,7 @@ export function createGatewayHandler({
 
         const anthropicResponse = await backendForRequest.createMessage(body, {
           requestHeaders: req.headers,
+          requestPath,
           requestUrl: req.url,
           abortSignal: requestAbort.signal,
         });
@@ -357,6 +362,7 @@ export async function startGatewayServer({
   });
   const resolvedNativeBackend = claudeBackend || createAnthropicBackend({
     baseUrl: nativeAnthropicBaseUrl,
+    env,
   });
   const handler = createGatewayHandler({
     config,
